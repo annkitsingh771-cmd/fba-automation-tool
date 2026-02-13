@@ -6,9 +6,9 @@ import zipfile
 from datetime import timedelta
 
 st.set_page_config(page_title="FBA Enterprise Planner", layout="wide")
-st.title("📦 FBA Enterprise Sales & Inventory Intelligence Tool")
+st.title("📦 FBA Enterprise Inventory & Product Intelligence Tool")
 
-st.markdown("Upload MTR (ZIP/CSV) and Inventory (ZIP/CSV)")
+st.markdown("Upload MTR (ZIP/CSV) and Inventory Ledger (ZIP/CSV)")
 
 # ================= FILE UPLOAD =================
 mtr_files = st.file_uploader(
@@ -18,11 +18,11 @@ mtr_files = st.file_uploader(
 )
 
 inventory_file = st.file_uploader(
-    "Upload Inventory File (ZIP or CSV)",
+    "Upload Inventory Ledger File (ZIP or CSV)",
     type=["csv", "zip"]
 )
 
-# ================= READ FUNCTION =================
+# ================= FILE READER =================
 def read_uploaded_file(uploaded_file):
     if uploaded_file.name.endswith(".zip"):
         with zipfile.ZipFile(uploaded_file) as z:
@@ -46,29 +46,36 @@ if mtr_files and inventory_file:
     sales_data["Quantity"] = pd.to_numeric(sales_data["Quantity"], errors="coerce").fillna(0)
     sales_data["Shipment Date"] = pd.to_datetime(sales_data["Shipment Date"], errors="coerce")
 
-    # ===== LOAD INVENTORY =====
+    # ===== LOAD INVENTORY LEDGER =====
     inventory_data = read_uploaded_file(inventory_file)
-
-    inventory_data.columns = inventory_data.columns.astype(str)
     inventory_data.columns = inventory_data.columns.str.strip()
 
-    st.subheader("📦 Inventory File Preview")
-    st.write("Detected Columns:")
-    st.write(list(inventory_data.columns))
+    # Auto detect stock column
+    if "Ending Warehouse Balance" in inventory_data.columns:
+        stock_column = "Ending Warehouse Balance"
+    else:
+        st.error("Ending Warehouse Balance column not found. Upload Inventory Ledger report.")
+        st.stop()
 
-    # ===== MANUAL COLUMN SELECTION =====
-    sku_column = st.selectbox(
-        "Select SKU Column from Inventory File",
-        inventory_data.columns
+    # SKU column detect
+    if "MSKU" in inventory_data.columns:
+        sku_column = "MSKU"
+    elif "FNSKU" in inventory_data.columns:
+        sku_column = "FNSKU"
+    else:
+        st.error("SKU column not detected in Inventory file.")
+        st.stop()
+
+    # Latest stock per SKU
+    inventory_data["Date"] = pd.to_datetime(inventory_data["Date"], errors="coerce")
+
+    latest_stock = (
+        inventory_data.sort_values("Date")
+        .groupby(sku_column)
+        .tail(1)
     )
 
-    stock_column = st.selectbox(
-        "Select Current Stock Column",
-        inventory_data.columns
-    )
-
-    # ===== STOCK SUMMARY =====
-    stock_summary = inventory_data[[sku_column, stock_column]].copy()
+    stock_summary = latest_stock[[sku_column, stock_column]].copy()
     stock_summary.columns = ["Sku", "Current FBA Stock"]
 
     stock_summary["Current FBA Stock"] = pd.to_numeric(
@@ -94,14 +101,20 @@ if mtr_files and inventory_file:
     # ===== PRODUCT INFO =====
     product_info = sales_data[["Sku", "Asin", "Item Description"]].drop_duplicates()
 
-    # ===== MERGE PRODUCT REPORT =====
+    # ===== MERGE CLEAN REPORT =====
     product_report = total_sales.merge(stock_summary, on="Sku", how="left")
-    product_report = product_report.merge(fba_summary, on="Sku", how="left")
-    product_report = product_report.merge(mfn_summary, on="Sku", how="left")
+    product_report = product_report.merge(fba_summary, on="Sku", how="left", suffixes=("","_FBA"))
+    product_report = product_report.merge(mfn_summary, on="Sku", how="left", suffixes=("","_MFN"))
     product_report = product_report.merge(avg_daily[["Sku", "Avg Daily Sale"]], on="Sku", how="left")
     product_report = product_report.merge(product_info, on="Sku", how="left")
 
     product_report = product_report.fillna(0)
+
+    product_report.rename(columns={
+        "Quantity": "Total Sales",
+        "Quantity_FBA": "FBA Sales",
+        "Quantity_MFN": "MFN Sales"
+    }, inplace=True)
 
     product_report["30 Day Forecast"] = product_report["Avg Daily Sale"] * 30
     product_report["Days of Cover"] = product_report["Current FBA Stock"] / product_report["Avg Daily Sale"].replace(0,1)
@@ -112,7 +125,7 @@ if mtr_files and inventory_file:
         "✅ Healthy"
     )
 
-    # ===== STATE WISE SALES =====
+    # ===== STATE WISE =====
     state_sales = (
         sales_data.groupby(["Sku", "Ship To State"])["Quantity"]
         .sum()
@@ -145,4 +158,4 @@ if mtr_files and inventory_file:
     )
 
 else:
-    st.info("Upload both MTR and Inventory file to continue.")
+    st.info("Upload both MTR and Inventory Ledger file to continue.")
