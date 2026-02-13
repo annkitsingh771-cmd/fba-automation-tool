@@ -5,157 +5,159 @@ import io
 import zipfile
 from datetime import timedelta
 
-st.set_page_config(page_title="FBA Enterprise Planner", layout="wide")
-st.title("📦 FBA Enterprise Inventory & Product Intelligence Tool")
+st.set_page_config(page_title="FBA Intelligence Pro", layout="wide")
 
-st.markdown("Upload MTR (ZIP/CSV) and Inventory Ledger (ZIP/CSV)")
+st.title("🚀 FBA Advanced Intelligence Dashboard")
+st.markdown("Upload MTR (Sales) + Inventory Ledger to unlock full analytics")
 
-# ================= FILE UPLOAD =================
+# ---------------- FILE UPLOAD ----------------
+
 mtr_files = st.file_uploader(
-    "Upload MTR Files (ZIP or CSV)",
-    type=["csv", "zip"],
+    "Upload MTR Files (ZIP/CSV)",
+    type=["csv","zip"],
     accept_multiple_files=True
 )
 
 inventory_file = st.file_uploader(
-    "Upload Inventory Ledger File (ZIP or CSV)",
-    type=["csv", "zip"]
+    "Upload Inventory Ledger (ZIP/CSV)",
+    type=["csv","zip"]
 )
 
-# ================= FILE READER =================
-def read_uploaded_file(uploaded_file):
-    if uploaded_file.name.endswith(".zip"):
-        with zipfile.ZipFile(uploaded_file) as z:
+# ---------------- FILE READER ----------------
+
+def read_file(uploaded):
+    if uploaded.name.endswith(".zip"):
+        with zipfile.ZipFile(uploaded) as z:
             for name in z.namelist():
                 if name.endswith(".csv"):
                     return pd.read_csv(z.open(name), low_memory=False)
     else:
-        return pd.read_csv(uploaded_file, low_memory=False)
+        return pd.read_csv(uploaded, low_memory=False)
 
-# ================= PROCESS =================
+# ---------------- MAIN LOGIC ----------------
+
 if mtr_files and inventory_file:
 
-    # ===== LOAD SALES =====
-    sales_list = []
-    for file in mtr_files:
-        df = read_uploaded_file(file)
-        sales_list.append(df)
+    # SALES LOAD
+    sales_list = [read_file(f) for f in mtr_files]
+    sales = pd.concat(sales_list, ignore_index=True)
 
-    sales_data = pd.concat(sales_list, ignore_index=True)
+    sales["Quantity"] = pd.to_numeric(sales["Quantity"], errors="coerce").fillna(0)
+    sales["Shipment Date"] = pd.to_datetime(sales["Shipment Date"], errors="coerce")
 
-    sales_data["Quantity"] = pd.to_numeric(sales_data["Quantity"], errors="coerce").fillna(0)
-    sales_data["Shipment Date"] = pd.to_datetime(sales_data["Shipment Date"], errors="coerce")
+    # INVENTORY LOAD
+    inventory = read_file(inventory_file)
+    inventory.columns = inventory.columns.str.strip()
 
-    # ===== LOAD INVENTORY LEDGER =====
-    inventory_data = read_uploaded_file(inventory_file)
-    inventory_data.columns = inventory_data.columns.str.strip()
-
-    # Auto detect stock column
-    if "Ending Warehouse Balance" in inventory_data.columns:
-        stock_column = "Ending Warehouse Balance"
-    else:
-        st.error("Ending Warehouse Balance column not found. Upload Inventory Ledger report.")
+    if "Ending Warehouse Balance" not in inventory.columns:
+        st.error("Upload Inventory Ledger report (Ending Warehouse Balance required)")
         st.stop()
 
-    # SKU column detect
-    if "MSKU" in inventory_data.columns:
-        sku_column = "MSKU"
-    elif "FNSKU" in inventory_data.columns:
-        sku_column = "FNSKU"
-    else:
-        st.error("SKU column not detected in Inventory file.")
+    if "MSKU" not in inventory.columns:
+        st.error("MSKU column missing in inventory file")
         st.stop()
 
-    # Latest stock per SKU
-    inventory_data["Date"] = pd.to_datetime(inventory_data["Date"], errors="coerce")
+    inventory["Date"] = pd.to_datetime(inventory["Date"], errors="coerce")
 
     latest_stock = (
-        inventory_data.sort_values("Date")
-        .groupby(sku_column)
+        inventory.sort_values("Date")
+        .groupby("MSKU")
         .tail(1)
     )
 
-    stock_summary = latest_stock[[sku_column, stock_column]].copy()
-    stock_summary.columns = ["Sku", "Current FBA Stock"]
+    stock = latest_stock[["MSKU","Ending Warehouse Balance"]]
+    stock.columns = ["Sku","Current Stock"]
+    stock["Current Stock"] = pd.to_numeric(stock["Current Stock"], errors="coerce").fillna(0)
 
-    stock_summary["Current FBA Stock"] = pd.to_numeric(
-        stock_summary["Current FBA Stock"], errors="coerce"
-    ).fillna(0)
+    # SALES SPLIT
+    total_sales = sales.groupby("Sku")["Quantity"].sum().reset_index()
+    fba_sales = sales[sales["Fulfillment Channel"]=="AFN"].groupby("Sku")["Quantity"].sum().reset_index()
+    mfn_sales = sales[sales["Fulfillment Channel"]=="MFN"].groupby("Sku")["Quantity"].sum().reset_index()
 
-    # ===== SALES SUMMARY =====
-    total_sales = sales_data.groupby("Sku")["Quantity"].sum().reset_index()
-
-    fba_sales = sales_data[sales_data["Fulfillment Channel"] == "AFN"]
-    mfn_sales = sales_data[sales_data["Fulfillment Channel"] == "MFN"]
-
-    fba_summary = fba_sales.groupby("Sku")["Quantity"].sum().reset_index()
-    mfn_summary = mfn_sales.groupby("Sku")["Quantity"].sum().reset_index()
-
-    # ===== FORECAST =====
-    max_date = sales_data["Shipment Date"].max()
-    last_30 = sales_data[sales_data["Shipment Date"] >= max_date - timedelta(days=30)]
-
+    # FORECAST
+    max_date = sales["Shipment Date"].max()
+    last_30 = sales[sales["Shipment Date"] >= max_date - timedelta(days=30)]
     avg_daily = last_30.groupby("Sku")["Quantity"].sum().reset_index()
-    avg_daily["Avg Daily Sale"] = avg_daily["Quantity"] / 30
+    avg_daily["Avg Daily"] = avg_daily["Quantity"] / 30
 
-    # ===== PRODUCT INFO =====
-    product_info = sales_data[["Sku", "Asin", "Item Description"]].drop_duplicates()
+    # MERGE
+    report = total_sales.merge(stock,on="Sku",how="left")
+    report = report.merge(fba_sales,on="Sku",how="left",suffixes=("","_FBA"))
+    report = report.merge(mfn_sales,on="Sku",how="left",suffixes=("","_MFN"))
+    report = report.merge(avg_daily[["Sku","Avg Daily"]],on="Sku",how="left")
 
-    # ===== MERGE CLEAN REPORT =====
-    product_report = total_sales.merge(stock_summary, on="Sku", how="left")
-    product_report = product_report.merge(fba_summary, on="Sku", how="left", suffixes=("","_FBA"))
-    product_report = product_report.merge(mfn_summary, on="Sku", how="left", suffixes=("","_MFN"))
-    product_report = product_report.merge(avg_daily[["Sku", "Avg Daily Sale"]], on="Sku", how="left")
-    product_report = product_report.merge(product_info, on="Sku", how="left")
+    report.fillna(0,inplace=True)
 
-    product_report = product_report.fillna(0)
+    report.rename(columns={
+        "Quantity":"Total Sales",
+        "Quantity_FBA":"FBA Sales",
+        "Quantity_MFN":"MFN Sales"
+    },inplace=True)
 
-    product_report.rename(columns={
-        "Quantity": "Total Sales",
-        "Quantity_FBA": "FBA Sales",
-        "Quantity_MFN": "MFN Sales"
-    }, inplace=True)
+    report["30 Day Forecast"] = report["Avg Daily"]*30
+    report["Days of Cover"] = report["Current Stock"] / report["Avg Daily"].replace(0,1)
 
-    product_report["30 Day Forecast"] = product_report["Avg Daily Sale"] * 30
-    product_report["Days of Cover"] = product_report["Current FBA Stock"] / product_report["Avg Daily Sale"].replace(0,1)
+    report["Reorder Qty (45D Cover)"] = (report["Avg Daily"]*45) - report["Current Stock"]
 
-    product_report["Stock Status"] = np.where(
-        product_report["Days of Cover"] < 30,
-        "⚠ Restock Required",
-        "✅ Healthy"
+    report["Stock Status"] = np.where(
+        report["Days of Cover"]<15,"🔴 Critical",
+        np.where(report["Days of Cover"]<30,"🟠 Warning","🟢 Healthy")
     )
 
-    # ===== STATE WISE =====
-    state_sales = (
-        sales_data.groupby(["Sku", "Ship To State"])["Quantity"]
-        .sum()
-        .reset_index()
-    )
+    # ---------------- KPI DASHBOARD ----------------
 
-    # ===== DASHBOARD =====
-    st.subheader("📦 Product Performance Report")
-    st.dataframe(product_report, use_container_width=True)
+    st.subheader("📊 Executive KPI")
+
+    col1,col2,col3,col4 = st.columns(4)
+
+    col1.metric("Total Units Sold",int(report["Total Sales"].sum()))
+    col2.metric("Total FBA Sales",int(report["FBA Sales"].sum()))
+    col3.metric("Total MFN Sales",int(report["MFN Sales"].sum()))
+    col4.metric("Current Total Stock",int(report["Current Stock"].sum()))
+
+    st.divider()
+
+    # ---------------- CHARTS ----------------
+
+    st.subheader("📈 Sales Trend")
+
+    daily_sales = sales.groupby("Shipment Date")["Quantity"].sum()
+    st.line_chart(daily_sales)
+
+    st.subheader("🏆 Top Performing SKUs")
+    top_sku = report.sort_values("Total Sales",ascending=False).head(10)
+    st.bar_chart(top_sku.set_index("Sku")["Total Sales"])
+
+    st.subheader("🚚 FBA vs MFN Comparison")
+    channel_summary = sales.groupby("Fulfillment Channel")["Quantity"].sum()
+    st.bar_chart(channel_summary)
 
     st.subheader("🌍 State Wise Sales")
-    st.dataframe(state_sales, use_container_width=True)
+    state_sales = sales.groupby("Ship To State")["Quantity"].sum().sort_values(ascending=False)
+    st.bar_chart(state_sales)
 
-    # ===== EXCEL EXPORT =====
+    st.subheader("📦 Inventory Planning Table")
+    st.dataframe(report, use_container_width=True)
+
+    # ---------------- EXCEL EXPORT ----------------
+
     def generate_excel():
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            product_report.to_excel(writer, sheet_name="Product Report", index=False)
-            state_sales.to_excel(writer, sheet_name="State Wise Sales", index=False)
+            report.to_excel(writer, sheet_name="Product Intelligence", index=False)
+            state_sales.to_excel(writer, sheet_name="State Sales")
+            daily_sales.to_excel(writer, sheet_name="Sales Trend")
         output.seek(0)
         return output
 
     excel_data = generate_excel()
 
     st.download_button(
-        label="Download Full Enterprise Report",
-        data=excel_data,
-        file_name="FBA_Enterprise_Report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        "📥 Download Full Intelligence Report",
+        excel_data,
+        "FBA_Advanced_Intelligence.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
 else:
-    st.info("Upload both MTR and Inventory Ledger file to continue.")
+    st.info("Upload Sales and Inventory file to begin.")
