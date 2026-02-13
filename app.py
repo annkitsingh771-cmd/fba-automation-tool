@@ -5,10 +5,10 @@ import io
 import zipfile
 from datetime import timedelta
 
-st.set_page_config(page_title="FBA Master Planner", layout="wide")
-st.title("📦 FBA Advanced Inventory & Product Intelligence Tool")
+st.set_page_config(page_title="FBA Enterprise Planner", layout="wide")
+st.title("📦 FBA Enterprise Sales & Inventory Intelligence Tool")
 
-st.markdown("Upload MTR ZIP/CSV + Inventory ZIP/CSV")
+st.markdown("Upload MTR (ZIP/CSV) and Inventory (ZIP/CSV)")
 
 # ================= FILE UPLOAD =================
 mtr_files = st.file_uploader(
@@ -18,18 +18,17 @@ mtr_files = st.file_uploader(
 )
 
 inventory_file = st.file_uploader(
-    "Upload Inventory Report (ZIP or CSV)",
+    "Upload Inventory File (ZIP or CSV)",
     type=["csv", "zip"]
 )
 
-# ================= HELPER FUNCTION =================
-def read_file(uploaded_file):
+# ================= READ FUNCTION =================
+def read_uploaded_file(uploaded_file):
     if uploaded_file.name.endswith(".zip"):
         with zipfile.ZipFile(uploaded_file) as z:
-            file_list = z.namelist()
-            for file in file_list:
-                if file.endswith(".csv"):
-                    return pd.read_csv(z.open(file), low_memory=False)
+            for name in z.namelist():
+                if name.endswith(".csv"):
+                    return pd.read_csv(z.open(name), low_memory=False)
     else:
         return pd.read_csv(uploaded_file, low_memory=False)
 
@@ -39,7 +38,7 @@ if mtr_files and inventory_file:
     # ===== LOAD SALES =====
     sales_list = []
     for file in mtr_files:
-        df = read_file(file)
+        df = read_uploaded_file(file)
         sales_list.append(df)
 
     sales_data = pd.concat(sales_list, ignore_index=True)
@@ -48,44 +47,33 @@ if mtr_files and inventory_file:
     sales_data["Shipment Date"] = pd.to_datetime(sales_data["Shipment Date"], errors="coerce")
 
     # ===== LOAD INVENTORY =====
-    inventory_data = read_file(inventory_file)
+    inventory_data = read_uploaded_file(inventory_file)
+
+    inventory_data.columns = inventory_data.columns.astype(str)
     inventory_data.columns = inventory_data.columns.str.strip()
 
-    # Improved stock detection
-    possible_stock_columns = [
-        "Available",
-        "Available Quantity",
-        "afn-available-quantity",
-        "quantity",
-        "fulfillable-quantity"
-    ]
+    st.subheader("📦 Inventory File Preview")
+    st.write("Detected Columns:")
+    st.write(list(inventory_data.columns))
 
-    stock_column = None
-    for col in inventory_data.columns:
-        for possible in possible_stock_columns:
-            if possible.lower() in col.lower():
-                stock_column = col
-                break
+    # ===== MANUAL COLUMN SELECTION =====
+    sku_column = st.selectbox(
+        "Select SKU Column from Inventory File",
+        inventory_data.columns
+    )
 
-    if stock_column is None:
-        st.error("❌ Stock column not detected. Please upload standard Amazon FBA Inventory report.")
-        st.write("Detected columns:")
-        st.write(inventory_data.columns)
-        st.stop()
+    stock_column = st.selectbox(
+        "Select Current Stock Column",
+        inventory_data.columns
+    )
 
-    # Detect SKU column
-    sku_column = None
-    for col in inventory_data.columns:
-        if "sku" in col.lower():
-            sku_column = col
-            break
-
-    if sku_column is None:
-        st.error("❌ SKU column not detected in inventory file.")
-        st.stop()
-
+    # ===== STOCK SUMMARY =====
     stock_summary = inventory_data[[sku_column, stock_column]].copy()
     stock_summary.columns = ["Sku", "Current FBA Stock"]
+
+    stock_summary["Current FBA Stock"] = pd.to_numeric(
+        stock_summary["Current FBA Stock"], errors="coerce"
+    ).fillna(0)
 
     # ===== SALES SUMMARY =====
     total_sales = sales_data.groupby("Sku")["Quantity"].sum().reset_index()
@@ -124,21 +112,21 @@ if mtr_files and inventory_file:
         "✅ Healthy"
     )
 
-    # ===== STATE WISE =====
+    # ===== STATE WISE SALES =====
     state_sales = (
         sales_data.groupby(["Sku", "Ship To State"])["Quantity"]
         .sum()
         .reset_index()
     )
 
-    # ================= DASHBOARD =================
+    # ===== DASHBOARD =====
     st.subheader("📦 Product Performance Report")
     st.dataframe(product_report, use_container_width=True)
 
     st.subheader("🌍 State Wise Sales")
     st.dataframe(state_sales, use_container_width=True)
 
-    # ================= EXCEL EXPORT =================
+    # ===== EXCEL EXPORT =====
     def generate_excel():
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
@@ -150,11 +138,11 @@ if mtr_files and inventory_file:
     excel_data = generate_excel()
 
     st.download_button(
-        label="Download Full Business Report",
+        label="Download Full Enterprise Report",
         data=excel_data,
-        file_name="FBA_Master_Report.xlsx",
+        file_name="FBA_Enterprise_Report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
 else:
-    st.info("Upload both MTR and Inventory file (ZIP or CSV).")
+    st.info("Upload both MTR and Inventory file to continue.")
