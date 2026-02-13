@@ -4,154 +4,133 @@ import numpy as np
 import io
 from datetime import timedelta
 
-st.set_page_config(page_title="FBA Automation Tool", layout="wide")
+st.set_page_config(page_title="FBA Master Planner", layout="wide")
+st.title("📦 Advanced FBA Sales & Inventory Intelligence Tool")
 
-st.title("📦 FBA Automation & Inventory Planning Tool")
-st.markdown("Upload Amazon MTR CSV files to generate a professional report.")
+st.markdown("Upload MTR (Sales) + FBA Inventory Report")
 
-uploaded_files = st.file_uploader(
-    "Upload MTR CSV Files",
+# ================= FILE UPLOAD =================
+mtr_files = st.file_uploader(
+    "Upload MTR CSV Files (Sales Data)",
     type=["csv"],
     accept_multiple_files=True
 )
 
-if uploaded_files:
+inventory_file = st.file_uploader(
+    "Upload FBA Inventory Report CSV",
+    type=["csv"]
+)
 
-    # ===== LOAD DATA =====
-    all_data = []
-    for file in uploaded_files:
+if mtr_files and inventory_file:
+
+    # ================= LOAD SALES =================
+    sales_list = []
+    for file in mtr_files:
         df = pd.read_csv(file, low_memory=False)
-        all_data.append(df)
+        sales_list.append(df)
 
-    data = pd.concat(all_data, ignore_index=True)
+    sales_data = pd.concat(sales_list, ignore_index=True)
 
-    # ===== DATA CLEANING =====
-    data["Quantity"] = pd.to_numeric(data["Quantity"], errors="coerce").fillna(0)
-    data["Shipment Date"] = pd.to_datetime(data["Shipment Date"], errors="coerce")
+    sales_data["Quantity"] = pd.to_numeric(sales_data["Quantity"], errors="coerce").fillna(0)
+    sales_data["Shipment Date"] = pd.to_datetime(sales_data["Shipment Date"], errors="coerce")
 
-    st.success("Files uploaded successfully!")
+    # ================= LOAD INVENTORY =================
+    inventory_data = pd.read_csv(inventory_file)
+    inventory_data.columns = inventory_data.columns.str.strip()
 
-    # ===== EXECUTIVE SUMMARY =====
-    total_units = int(data["Quantity"].sum())
+    stock_column = None
+    for col in inventory_data.columns:
+        if "available" in col.lower():
+            stock_column = col
+            break
 
-    max_date = data["Shipment Date"].max()
-    last_30 = data[data["Shipment Date"] >= max_date - timedelta(days=30)]
+    if stock_column is None:
+        st.error("Stock column not found in inventory file.")
+        st.stop()
 
-    avg_daily_sales = last_30["Quantity"].sum() / 30
-    forecast_30 = avg_daily_sales * 30
-    recommended_stock = avg_daily_sales * 45
+    inventory_data = inventory_data.rename(columns={"sku": "Sku"})
+    stock_summary = inventory_data[["Sku", stock_column]].copy()
+    stock_summary.columns = ["Sku", "Current FBA Stock"]
 
-    col1, col2, col3, col4 = st.columns(4)
+    # ================= SALES SUMMARY =================
+    total_sales = sales_data.groupby("Sku")["Quantity"].sum().reset_index()
 
-    col1.metric("Total Units Sold", total_units)
-    col2.metric("Avg Daily Sales (30D)", round(avg_daily_sales, 2))
-    col3.metric("30 Day Forecast", round(forecast_30, 2))
-    col4.metric("Recommended Stock (45 Days Cover)", round(recommended_stock, 2))
+    fba_sales = sales_data[sales_data["Fulfillment Channel"] == "AFN"]
+    mfn_sales = sales_data[sales_data["Fulfillment Channel"] == "MFN"]
 
-    st.divider()
+    fba_summary = fba_sales.groupby("Sku")["Quantity"].sum().reset_index()
+    mfn_summary = mfn_sales.groupby("Sku")["Quantity"].sum().reset_index()
 
-    # ===== STATE WISE SALES =====
-    st.subheader("📊 State Wise Sales")
+    # ================= PRODUCT INFO =================
+    product_info = sales_data[["Sku", "Asin", "Item Description"]].drop_duplicates()
 
-    state_summary = (
-        data.groupby("Ship To State")["Quantity"]
+    # ================= FORECAST =================
+    max_date = sales_data["Shipment Date"].max()
+    last_30 = sales_data[sales_data["Shipment Date"] >= max_date - timedelta(days=30)]
+
+    avg_daily = last_30.groupby("Sku")["Quantity"].sum().reset_index()
+    avg_daily["Avg Daily Sale"] = avg_daily["Quantity"] / 30
+
+    # ================= MERGE PRODUCT REPORT =================
+    product_report = total_sales.merge(stock_summary, on="Sku", how="left")
+    product_report = product_report.merge(fba_summary, on="Sku", how="left")
+    product_report = product_report.merge(mfn_summary, on="Sku", how="left")
+    product_report = product_report.merge(avg_daily[["Sku", "Avg Daily Sale"]], on="Sku", how="left")
+    product_report = product_report.merge(product_info, on="Sku", how="left")
+
+    product_report.columns = [
+        "Sku",
+        "Total Sales",
+        "Current FBA Stock",
+        "FBA Sales",
+        "MFN Sales",
+        "Avg Daily Sale",
+        "Asin",
+        "Product Name"
+    ]
+
+    product_report = product_report.fillna(0)
+
+    product_report["30 Day Forecast"] = product_report["Avg Daily Sale"] * 30
+    product_report["Days of Cover"] = product_report["Current FBA Stock"] / product_report["Avg Daily Sale"].replace(0,1)
+
+    product_report["Stock Status"] = np.where(
+        product_report["Days of Cover"] < 30,
+        "⚠ Restock Required",
+        "✅ Healthy"
+    )
+
+    # ================= STATE WISE =================
+    state_sales = (
+        sales_data.groupby(["Sku", "Ship To State"])["Quantity"]
         .sum()
         .reset_index()
-        .sort_values(by="Quantity", ascending=False)
     )
 
-    st.dataframe(state_summary, use_container_width=True)
-    st.bar_chart(state_summary.set_index("Ship To State"))
+    # ================= DASHBOARD =================
+    st.subheader("📦 Product Performance Report")
+    st.dataframe(product_report, use_container_width=True)
 
-    # ===== FBA vs MFN =====
-    st.subheader("🚚 FBA vs MFN Analysis")
+    st.subheader("🌍 State Wise Sales")
+    st.dataframe(state_sales, use_container_width=True)
 
-    channel_summary = (
-        data.groupby("Fulfillment Channel")["Quantity"]
-        .sum()
-        .reset_index()
-    )
-
-    st.dataframe(channel_summary, use_container_width=True)
-    st.bar_chart(channel_summary.set_index("Fulfillment Channel"))
-
-    # ===== TOP CITIES =====
-    st.subheader("🏙 Top Cities")
-
-    city_summary = (
-        data.groupby("Ship To City")["Quantity"]
-        .sum()
-        .reset_index()
-        .sort_values(by="Quantity", ascending=False)
-        .head(15)
-    )
-
-    st.dataframe(city_summary, use_container_width=True)
-
-    # ===== DEAD STOCK =====
-    st.subheader("🧠 Dead Stock Alert")
-
-    sku_last_sale = (
-        data.groupby("Sku")["Shipment Date"]
-        .max()
-        .reset_index()
-    )
-
-    sku_last_sale["Days Since Last Sale"] = (
-        max_date - sku_last_sale["Shipment Date"]
-    ).dt.days
-
-    dead_stock = sku_last_sale[sku_last_sale["Days Since Last Sale"] > 60]
-
-    if len(dead_stock) > 0:
-        st.warning("⚠ Dead stock detected (No sale in 60+ days)")
-        st.dataframe(dead_stock, use_container_width=True)
-    else:
-        st.success("✅ No dead stock detected")
-
-    # ===== EXCEL REPORT =====
-    st.subheader("📥 Download Excel Report")
-
+    # ================= EXCEL EXPORT =================
     def generate_excel():
         output = io.BytesIO()
-
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-
-            # Executive Summary Sheet
-            summary_df = pd.DataFrame({
-                "Metric": [
-                    "Total Units Sold",
-                    "Avg Daily Sales (30 Days)",
-                    "30 Day Forecast",
-                    "Recommended Stock (45 Days Cover)"
-                ],
-                "Value": [
-                    total_units,
-                    round(avg_daily_sales, 2),
-                    round(forecast_30, 2),
-                    round(recommended_stock, 2)
-                ]
-            })
-
-            summary_df.to_excel(writer, sheet_name="Executive Summary", index=False)
-            state_summary.to_excel(writer, sheet_name="State Wise Sales", index=False)
-            channel_summary.to_excel(writer, sheet_name="FBA vs MFN", index=False)
-            city_summary.to_excel(writer, sheet_name="Top Cities", index=False)
-
-            if len(dead_stock) > 0:
-                dead_stock.to_excel(writer, sheet_name="Dead Stock", index=False)
-
+            product_report.to_excel(writer, sheet_name="Product Report", index=False)
+            state_sales.to_excel(writer, sheet_name="State Wise Sales", index=False)
         output.seek(0)
         return output
 
     excel_data = generate_excel()
 
     st.download_button(
-        label="Download Full Professional Report",
+        label="Download Full Business Report",
         data=excel_data,
-        file_name="FBA_Professional_Report.xlsx",
+        file_name="FBA_Master_Product_Report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
 else:
-    st.info("Please upload at least one MTR CSV file to begin analysis.")
+    st.info("Upload both Sales (MTR) and Inventory file to continue.")
