@@ -8,16 +8,24 @@ import math
 st.set_page_config(page_title="FBA Supply Intelligence", layout="wide")
 st.title("📦 FBA Supply Intelligence System")
 
+# ---------------- SERIAL FUNCTION ----------------
+def add_serial(df):
+    df = df.copy()
+    if "S.No" in df.columns:
+        df = df.drop(columns=["S.No"])
+    df.insert(0, "S.No", range(1, len(df) + 1))
+    return df
+
 # ---------------- USER INPUT ----------------
 planning_days = st.number_input("Stock Planning Period (Days)", 1, 180, 30)
 
 service_level_option = st.selectbox(
-    "Service Level (Safety)",
+    "Service Level (Safety Level)",
     ["90%", "95%", "98%"]
 )
 
 z_map = {"90%": 1.28, "95%": 1.65, "98%": 2.05}
-z_value = z_map[service_level_option]
+z_value = float(z_map[service_level_option])
 
 # ---------------- FILE UPLOAD ----------------
 mtr_files = st.file_uploader("Upload MTR (ZIP/CSV)", type=["csv","zip"], accept_multiple_files=True)
@@ -63,6 +71,10 @@ if mtr_files and inventory_file:
 
     sales = sales.dropna(subset=["Shipment Date"])
 
+    if sales.empty:
+        st.error("No valid shipment dates found.")
+        st.stop()
+
     # ===== LOAD INVENTORY =====
     inv = read_file(inventory_file)
 
@@ -95,24 +107,25 @@ if mtr_files and inventory_file:
 
     report.rename(columns={"Quantity":"Total Sales"}, inplace=True)
 
-    report["Sales Period (Days)"] = sales_period
+    report["Sales Period (Days)"] = float(sales_period)
     report["Avg Daily Sale"] = report["Total Sales"] / float(sales_period)
 
     # ===== DEMAND VOLATILITY =====
     daily_sales = sales.groupby(["Sku","Shipment Date"])["Quantity"].sum().reset_index()
+
     std_dev = daily_sales.groupby("Sku")["Quantity"].std().reset_index()
     std_dev.rename(columns={"Quantity":"Demand StdDev"}, inplace=True)
 
     report = report.merge(std_dev, on="Sku", how="left")
+
     report["Demand StdDev"] = pd.to_numeric(
         report["Demand StdDev"], errors="coerce"
     ).fillna(0)
 
-    # Safety Stock Calculation (Safe)
     report["Safety Stock"] = (
-        float(z_value)
-        * report["Demand StdDev"]
-        * math.sqrt(float(planning_days))
+        z_value *
+        report["Demand StdDev"] *
+        math.sqrt(float(planning_days))
     )
 
     report["Required Stock"] = (
@@ -125,7 +138,7 @@ if mtr_files and inventory_file:
 
     report["Days of Cover"] = report["Current Stock"] / report["Avg Daily Sale"].replace(0,1)
 
-    report.insert(0, "S.No", range(1, len(report)+1))
+    report = add_serial(report)
 
     # ===== DEAD STOCK =====
     last_sale = sales.groupby("Sku")["Shipment Date"].max().reset_index()
@@ -134,26 +147,28 @@ if mtr_files and inventory_file:
     ).dt.days
 
     dead_stock = last_sale.merge(latest_stock, on="Sku", how="left")
+    dead_stock["Current Stock"] = dead_stock["Current Stock"].fillna(0)
+
     dead_stock = dead_stock[
         (dead_stock["Days Since Last Sale"] > 60) &
         (dead_stock["Current Stock"] > 0)
     ]
 
-    dead_stock.insert(0, "S.No", range(1, len(dead_stock)+1))
+    dead_stock = add_serial(dead_stock)
 
     # ===== SLOW MOVING =====
     slow_moving = report[
-        (report["Days of Cover"] > 90)
+        report["Days of Cover"] > 90
     ].copy()
 
-    slow_moving.insert(0, "S.No", range(1, len(slow_moving)+1))
+    slow_moving = add_serial(slow_moving)
 
     # ===== EXCESS STOCK =====
     excess_stock = report[
         report["Days of Cover"] > (planning_days * 2)
     ].copy()
 
-    excess_stock.insert(0, "S.No", range(1, len(excess_stock)+1))
+    excess_stock = add_serial(excess_stock)
 
     # ===== STATE HEATMAP =====
     state_pivot = sales.pivot_table(
