@@ -8,21 +8,13 @@ from datetime import timedelta
 st.set_page_config(page_title="FBA Smart Supply Planner", layout="wide")
 st.title("📦 FBA Smart Supply Planner")
 
-st.markdown("Upload Sales (MTR) + Inventory Ledger")
+# ================= USER CONTROLS =================
+planning_days = st.number_input("Planning Days", min_value=1, max_value=180, value=30)
+safety_multiplier = st.slider("Safety Buffer Multiplier", 1.0, 2.0, 1.5)
 
-# ================= USER INPUT =================
-planning_days = st.number_input(
-    "Enter Planning Days (Example: 30, 45, 60)",
-    min_value=1,
-    max_value=180,
-    value=30
-)
-
-safety_multiplier = st.slider(
-    "Safety Buffer Multiplier",
-    min_value=1.0,
-    max_value=2.0,
-    value=1.5
+planning_mode = st.selectbox(
+    "Planning Based On",
+    ["Total Sales", "FBA Sales Only"]
 )
 
 # ================= CLUSTER MAP =================
@@ -59,16 +51,13 @@ def read_file(file):
 # ================= MAIN =================
 if mtr_files and inventory_file:
 
-    # ---------- LOAD SALES ----------
     sales = pd.concat([read_file(f) for f in mtr_files], ignore_index=True)
     sales["Quantity"] = pd.to_numeric(sales["Quantity"], errors="coerce").fillna(0)
     sales["Shipment Date"] = pd.to_datetime(sales["Shipment Date"], errors="coerce")
     sales["Ship To State"] = sales["Ship To State"].str.upper()
 
-    # ---------- LOAD INVENTORY ----------
     inv = read_file(inventory_file)
     inv.columns = inv.columns.str.strip()
-
     inv["Date"] = pd.to_datetime(inv["Date"], errors="coerce")
     latest_stock = inv.sort_values("Date").groupby("MSKU").tail(1)
 
@@ -76,26 +65,50 @@ if mtr_files and inventory_file:
     stock.columns = ["Sku","Current Stock"]
     stock["Current Stock"] = pd.to_numeric(stock["Current Stock"], errors="coerce").fillna(0)
 
-    # ---------- PRODUCT LEVEL ----------
+    # -------- SALES SPLIT --------
     total_sales = sales.groupby("Sku")["Quantity"].sum().reset_index()
 
-    max_date = sales["Shipment Date"].max()
-    last_30 = sales[sales["Shipment Date"] >= max_date - timedelta(days=30)]
-    avg_daily = last_30.groupby("Sku")["Quantity"].sum().reset_index()
-    avg_daily["Avg Daily Sale"] = avg_daily["Quantity"] / 30
+    fba_sales = sales[sales["Fulfillment Channel"]=="AFN"].groupby("Sku")["Quantity"].sum().reset_index()
+    fba_sales.rename(columns={"Quantity":"FBA Sales"}, inplace=True)
 
+    mfn_sales = sales[sales["Fulfillment Channel"]=="MFN"].groupby("Sku")["Quantity"].sum().reset_index()
+    mfn_sales.rename(columns={"Quantity":"MFN Sales"}, inplace=True)
+
+    # -------- MERGE PRODUCT --------
     report = total_sales.merge(stock,on="Sku",how="left")
-    report = report.merge(avg_daily[["Sku","Avg Daily Sale"]],on="Sku",how="left")
+    report = report.merge(fba_sales,on="Sku",how="left")
+    report = report.merge(mfn_sales,on="Sku",how="left")
     report.fillna(0,inplace=True)
 
-    report["Forecast Qty"] = report["Avg Daily Sale"] * planning_days
-    report["Days of Cover"] = report["Current Stock"] / report["Avg Daily Sale"].replace(0,1)
+    report.rename(columns={"Quantity":"Total Sales"}, inplace=True)
+
+    report["FBA %"] = report["FBA Sales"] / report["Total Sales"].replace(0,1)
+    report["MFN %"] = report["MFN Sales"] / report["Total Sales"].replace(0,1)
+
+    # -------- FORECAST BASE --------
+    max_date = sales["Shipment Date"].max()
+    last_30 = sales[sales["Shipment Date"] >= max_date - timedelta(days=30)]
+
+    if planning_mode == "FBA Sales Only":
+        base_data = last_30[last_30["Fulfillment Channel"]=="AFN"]
+    else:
+        base_data = last_30
+
+    avg_daily = base_data.groupby("Sku")["Quantity"].sum().reset_index()
+    avg_daily["Avg Daily"] = avg_daily["Quantity"]/30
+
+    report = report.merge(avg_daily[["Sku","Avg Daily"]], on="Sku", how="left")
+    report.fillna(0,inplace=True)
+
+    report["Forecast Qty"] = report["Avg Daily"]*planning_days
     report["Recommended Reorder Qty"] = (
-        (report["Avg Daily Sale"] * planning_days * safety_multiplier)
+        (report["Avg Daily"]*planning_days*safety_multiplier)
         - report["Current Stock"]
     ).clip(lower=0)
 
-    # ---------- CLUSTER ASSIGN ----------
+    report["Days of Cover"] = report["Current Stock"] / report["Avg Daily"].replace(0,1)
+
+    # -------- CLUSTER --------
     def assign_cluster(state):
         for cluster, states in cluster_map.items():
             if state in states:
@@ -104,57 +117,37 @@ if mtr_files and inventory_file:
 
     sales["Cluster Name"] = sales["Ship To State"].apply(assign_cluster)
 
-    cluster_sales = sales.groupby(["Sku","Cluster Name"])["Quantity"].sum().reset_index()
-    cluster_total = cluster_sales.groupby("Sku")["Quantity"].sum().reset_index()
-
-    cluster_sales = cluster_sales.merge(cluster_total,on="Sku",suffixes=("","_Total"))
-    cluster_sales["Cluster %"] = cluster_sales["Quantity"] / cluster_sales["Quantity_Total"]
-
-    cluster_sales = cluster_sales.merge(
-        report[["Sku","Current Stock","Avg Daily Sale"]],
-        on="Sku",how="left"
-    )
-
-    # Allocate current stock per cluster
-    cluster_sales["Cluster Allocated Current Stock"] = (
-        cluster_sales["Current Stock"] * cluster_sales["Cluster %"]
-    )
-
-    cluster_sales["Cluster Forecast Qty"] = (
-        cluster_sales["Avg Daily Sale"] * planning_days * cluster_sales["Cluster %"]
-    )
-
-    cluster_sales["Suggested Dispatch Qty"] = (
-        cluster_sales["Cluster Forecast Qty"] * safety_multiplier
-    )
+    cluster_sales = sales.groupby(
+        ["Sku","Cluster Name","Fulfillment Channel"]
+    )["Quantity"].sum().reset_index()
 
     cluster_sales["Mapped FC"] = cluster_sales["Cluster Name"].map(fc_map)
 
-    # ---------- FC PLAN ----------
-    fc_plan = cluster_sales.groupby("Mapped FC")["Suggested Dispatch Qty"].sum().reset_index()
+    # -------- FC PLAN --------
+    fc_plan = cluster_sales.groupby("Mapped FC")["Quantity"].sum().reset_index()
 
-    # ---------- UI ----------
+    # -------- DISPLAY --------
     st.subheader("📊 Product Planning")
     st.dataframe(report, use_container_width=True)
 
-    st.subheader("📍 Cluster Stock Planning")
+    st.subheader("📍 Cluster Sales (FBA & MFN Split)")
     st.dataframe(cluster_sales, use_container_width=True)
 
-    st.subheader("🏭 FC Shipment Plan")
+    st.subheader("🏭 FC Shipment Summary")
     st.dataframe(fc_plan, use_container_width=True)
 
-    # ---------- EXCEL EXPORT ----------
+    # -------- EXCEL --------
     def generate_excel():
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
             report.to_excel(writer,"Product Planning",index=False)
-            cluster_sales.to_excel(writer,"Cluster Planning",index=False)
-            fc_plan.to_excel(writer,"FC Shipment Plan",index=False)
+            cluster_sales.to_excel(writer,"Cluster Sales Split",index=False)
+            fc_plan.to_excel(writer,"FC Summary",index=False)
         output.seek(0)
         return output
 
     st.download_button(
-        "📥 Download Client Ready Planning Report",
+        "📥 Download Full Planning Report",
         generate_excel(),
         "FBA_Smart_Supply_Planner.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
