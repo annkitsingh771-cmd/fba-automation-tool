@@ -112,12 +112,10 @@ if mtr_files and inventory_file:
 
     # ===== DEMAND VOLATILITY =====
     daily_sales = sales.groupby(["Sku","Shipment Date"])["Quantity"].sum().reset_index()
-
     std_dev = daily_sales.groupby("Sku")["Quantity"].std().reset_index()
     std_dev.rename(columns={"Quantity":"Demand StdDev"}, inplace=True)
 
     report = report.merge(std_dev, on="Sku", how="left")
-
     report["Demand StdDev"] = pd.to_numeric(
         report["Demand StdDev"], errors="coerce"
     ).fillna(0)
@@ -157,25 +155,16 @@ if mtr_files and inventory_file:
     dead_stock = add_serial(dead_stock)
 
     # ===== SLOW MOVING =====
-    slow_moving = report[
-        report["Days of Cover"] > 90
-    ].copy()
-
+    slow_moving = report[report["Days of Cover"] > 90].copy()
     slow_moving = add_serial(slow_moving)
 
     # ===== EXCESS STOCK =====
-    excess_stock = report[
-        report["Days of Cover"] > (planning_days * 2)
-    ].copy()
-
+    excess_stock = report[report["Days of Cover"] > (planning_days * 2)].copy()
     excess_stock = add_serial(excess_stock)
 
-    # ===== STATE HEATMAP =====
-    state_pivot = sales.pivot_table(
-        values="Quantity",
-        index="Ship To State",
-        aggfunc="sum"
-    ).sort_values("Quantity", ascending=False)
+    # ===== STATE SUMMARY (NO MATPLOTLIB) =====
+    state_summary = sales.groupby("Ship To State")["Quantity"].sum().reset_index()
+    state_summary = state_summary.sort_values("Quantity", ascending=False)
 
     # ===== DISPLAY =====
     st.subheader("📊 Main Planning Report")
@@ -190,11 +179,8 @@ if mtr_files and inventory_file:
     st.subheader("🔵 Excess Stock Warning")
     st.dataframe(excess_stock, use_container_width=True)
 
-    st.subheader("🌍 State Sales Heatmap")
-    st.dataframe(
-        state_pivot.style.background_gradient(cmap="Reds"),
-        use_container_width=True
-    )
+    st.subheader("🌍 State Sales Summary")
+    st.dataframe(state_summary, use_container_width=True)
 
     # ===== EXCEL EXPORT =====
     def generate_excel():
@@ -204,7 +190,7 @@ if mtr_files and inventory_file:
             dead_stock.to_excel(writer,"Dead Stock",index=False)
             slow_moving.to_excel(writer,"Slow Moving",index=False)
             excess_stock.to_excel(writer,"Excess Stock",index=False)
-            state_pivot.to_excel(writer,"State Heatmap")
+            state_summary.to_excel(writer,"State Summary",index=False)
         output.seek(0)
         return output
 
