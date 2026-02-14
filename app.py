@@ -4,52 +4,21 @@ import numpy as np
 import io
 import zipfile
 from datetime import timedelta
+import math
 
-st.set_page_config(page_title="FBA Supply Planner", layout="wide")
-st.title("📦 FBA Supply Planner - Enterprise Version")
+st.set_page_config(page_title="FBA Supply Intelligence", layout="wide")
+st.title("📦 FBA Supply Intelligence System")
 
-# ================= USER INPUT =================
+# ---------------- USER INPUT ----------------
+planning_days = st.number_input("Stock Planning Period (Days)",1,180,30)
+service_level_z = st.selectbox("Service Level (Safety)",{
+    "90%":1.28,
+    "95%":1.65,
+    "98%":2.05
+})
+z_value = service_level_z
 
-planning_days = st.number_input(
-    "Stock Planning Period (Days)",
-    min_value=1,
-    max_value=180,
-    value=30
-)
-
-safety_multiplier = st.slider(
-    "Safety Buffer Multiplier",
-    min_value=1.0,
-    max_value=2.0,
-    value=1.3
-)
-
-planning_mode = st.selectbox(
-    "Planning Based On",
-    ["Total Sales", "FBA Sales Only"]
-)
-
-# ================= CLUSTER MAP =================
-
-cluster_map = {
-    "North Cluster": ["UTTAR PRADESH","DELHI","HARYANA","PUNJAB","RAJASTHAN"],
-    "West Cluster": ["MAHARASHTRA","GUJARAT"],
-    "South Cluster": ["TAMIL NADU","KARNATAKA","KERALA","TELANGANA","ANDHRA PRADESH"],
-    "East Cluster": ["WEST BENGAL","ODISHA","ASSAM","BIHAR"],
-    "Central Cluster": ["MADHYA PRADESH","CHHATTISGARH"]
-}
-
-fc_map = {
-    "North Cluster": "DEL FC",
-    "West Cluster": "BOM FC",
-    "South Cluster": "BLR FC",
-    "East Cluster": "CCU FC",
-    "Central Cluster": "HYD FC",
-    "Other Cluster": "DEL FC"
-}
-
-# ================= FILE UPLOAD =================
-
+# ---------------- FILE UPLOAD ----------------
 mtr_files = st.file_uploader("Upload MTR (ZIP/CSV)", type=["csv","zip"], accept_multiple_files=True)
 inventory_file = st.file_uploader("Upload Inventory Ledger (ZIP/CSV)", type=["csv","zip"])
 
@@ -62,21 +31,16 @@ def read_file(file):
     else:
         return pd.read_csv(file, low_memory=False)
 
-# ================= MAIN PROCESS =================
-
+# ---------------- MAIN ----------------
 if mtr_files and inventory_file:
 
-    # -------- LOAD SALES --------
     sales = pd.concat([read_file(f) for f in mtr_files], ignore_index=True)
 
     sales["Quantity"] = pd.to_numeric(sales["Quantity"], errors="coerce").fillna(0)
     sales["Shipment Date"] = pd.to_datetime(sales["Shipment Date"], errors="coerce")
     sales["Ship To State"] = sales["Ship To State"].str.upper()
-    sales["Ship From State"] = sales["Ship From State"].str.upper()
 
-    sales_period = (sales["Shipment Date"].max() - sales["Shipment Date"].min()).days + 1
-
-    # -------- LOAD INVENTORY --------
+    # ---------------- INVENTORY ----------------
     inv = read_file(inventory_file)
     inv.columns = inv.columns.str.strip()
     inv["Date"] = pd.to_datetime(inv["Date"], errors="coerce")
@@ -87,115 +51,107 @@ if mtr_files and inventory_file:
     stock.columns = ["Sku","Current Stock"]
     stock["Current Stock"] = pd.to_numeric(stock["Current Stock"], errors="coerce").fillna(0)
 
-    # -------- SALES SPLIT --------
+    # ---------------- SALES PERIOD ----------------
+    sales_period = (sales["Shipment Date"].max() - sales["Shipment Date"].min()).days + 1
+
     total_sales = sales.groupby("Sku")["Quantity"].sum().reset_index()
-
-    fba_sales = sales[sales["Fulfillment Channel"]=="AFN"] \
-        .groupby("Sku")["Quantity"].sum().reset_index()
-    fba_sales.rename(columns={"Quantity":"FBA Sales"}, inplace=True)
-
-    mfn_sales = sales[sales["Fulfillment Channel"]=="MFN"] \
-        .groupby("Sku")["Quantity"].sum().reset_index()
-    mfn_sales.rename(columns={"Quantity":"MFN Sales"}, inplace=True)
-
     report = total_sales.merge(stock,on="Sku",how="left")
-    report = report.merge(fba_sales,on="Sku",how="left")
-    report = report.merge(mfn_sales,on="Sku",how="left")
-
     report.fillna(0,inplace=True)
+
     report.rename(columns={"Quantity":"Total Sales"}, inplace=True)
 
-    # -------- SELECT BASE SALES --------
-    if planning_mode == "FBA Sales Only":
-        report["Base Sales"] = report["FBA Sales"]
-    else:
-        report["Base Sales"] = report["Total Sales"]
+    report["Sales Period (Days)"] = sales_period
+    report["Avg Daily Sale"] = report["Total Sales"] / sales_period
 
-    # -------- CALCULATIONS --------
-    report["Sales Data Period (Days)"] = sales_period
-    report["Avg Daily Sale"] = report["Base Sales"] / sales_period
-    report["Forecast Qty"] = report["Avg Daily Sale"] * planning_days
+    # ---------------- VOLATILITY SAFETY STOCK ----------------
+    daily_sales = sales.groupby(["Sku","Shipment Date"])["Quantity"].sum().reset_index()
+
+    std_dev = daily_sales.groupby("Sku")["Quantity"].std().reset_index()
+    std_dev.rename(columns={"Quantity":"Demand StdDev"}, inplace=True)
+
+    report = report.merge(std_dev,on="Sku",how="left")
+    report["Demand StdDev"] = report["Demand StdDev"].fillna(0)
+
+    report["Safety Stock"] = z_value * report["Demand StdDev"] * np.sqrt(planning_days)
+
+    report["Required Stock"] = (
+        (report["Avg Daily Sale"] * planning_days)
+        + report["Safety Stock"]
+    )
+
     report["Recommended Dispatch Qty"] = (
-        (report["Forecast Qty"] * safety_multiplier)
-        - report["Current Stock"]
+        report["Required Stock"] - report["Current Stock"]
     ).clip(lower=0)
 
     report["Days of Cover"] = report["Current Stock"] / report["Avg Daily Sale"].replace(0,1)
 
-    report.insert(0, "S.No", range(1, len(report)+1))
+    # ---------------- DEAD STOCK ----------------
+    last_sale = sales.groupby("Sku")["Shipment Date"].max().reset_index()
+    last_sale["Days Since Last Sale"] = (
+        sales["Shipment Date"].max() - last_sale["Shipment Date"]
+    ).dt.days
 
-    # -------- CLUSTER ASSIGNMENT --------
-    def assign_cluster(state):
-        for cluster, states in cluster_map.items():
-            if state in states:
-                return cluster
-        return "Other Cluster"
+    dead_stock = last_sale.merge(stock,on="Sku",how="left")
+    dead_stock = dead_stock[
+        (dead_stock["Days Since Last Sale"] > 60) &
+        (dead_stock["Current Stock"] > 0)
+    ]
 
-    sales["Cluster Name"] = sales["Ship To State"].apply(assign_cluster)
+    # ---------------- SLOW MOVING ----------------
+    slow_moving = report[
+        (report["Days of Cover"] > 90) &
+        (report["Avg Daily Sale"] < report["Avg Daily Sale"].median())
+    ]
 
-    cluster_sales = sales.groupby(
-        ["Sku","Cluster Name","Ship From State"]
-    )["Quantity"].sum().reset_index()
+    # ---------------- EXCESS STOCK ----------------
+    excess_stock = report[
+        report["Days of Cover"] > planning_days * 2
+    ]
 
-    cluster_total = cluster_sales.groupby("Sku")["Quantity"].sum().reset_index()
-    cluster_sales = cluster_sales.merge(cluster_total,on="Sku",suffixes=("","_Total"))
+    # ---------------- STATE HEATMAP ----------------
+    state_pivot = sales.pivot_table(
+        values="Quantity",
+        index="Ship To State",
+        aggfunc="sum"
+    ).sort_values("Quantity", ascending=False)
 
-    cluster_sales["Cluster %"] = cluster_sales["Quantity"] / cluster_sales["Quantity_Total"]
-
-    cluster_sales = cluster_sales.merge(
-        report[["Sku","Current Stock","Avg Daily Sale"]],
-        on="Sku",how="left"
-    )
-
-    cluster_sales["Cluster Allocated Stock"] = (
-        cluster_sales["Current Stock"] * cluster_sales["Cluster %"]
-    )
-
-    cluster_sales["Cluster Forecast Qty"] = (
-        cluster_sales["Avg Daily Sale"] * planning_days * cluster_sales["Cluster %"]
-    )
-
-    cluster_sales["Suggested Dispatch Qty"] = (
-        cluster_sales["Cluster Forecast Qty"] * safety_multiplier
-    )
-
-    cluster_sales["Mapped FC"] = cluster_sales["Cluster Name"].map(fc_map)
-
-    cluster_sales.insert(0, "S.No", range(1, len(cluster_sales)+1))
-
-    # -------- FC PLAN --------
-    fc_plan = cluster_sales.groupby(
-        ["Mapped FC","Cluster Name"]
-    )["Suggested Dispatch Qty"].sum().reset_index()
-
-    fc_plan.insert(0, "S.No", range(1, len(fc_plan)+1))
-
-    # -------- DISPLAY --------
-    st.subheader("📊 Product Planning")
+    # ---------------- DISPLAY ----------------
+    st.subheader("📊 Main Planning Report")
     st.dataframe(report, use_container_width=True)
 
-    st.subheader("📍 Cluster Planning")
-    st.dataframe(cluster_sales, use_container_width=True)
+    st.subheader("🔥 Dead Stock Alert (60+ days no sale)")
+    st.dataframe(dead_stock, use_container_width=True)
 
-    st.subheader("🏭 FC Shipment Plan")
-    st.dataframe(fc_plan, use_container_width=True)
+    st.subheader("🟡 Slow Moving SKUs")
+    st.dataframe(slow_moving, use_container_width=True)
 
-    # -------- EXCEL EXPORT --------
+    st.subheader("🔵 Excess Stock Warning")
+    st.dataframe(excess_stock, use_container_width=True)
+
+    st.subheader("🌍 State Sales Heatmap")
+    st.dataframe(
+        state_pivot.style.background_gradient(cmap="Reds"),
+        use_container_width=True
+    )
+
+    # ---------------- EXCEL EXPORT ----------------
     def generate_excel():
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            report.to_excel(writer,"Product Planning",index=False)
-            cluster_sales.to_excel(writer,"Cluster Planning",index=False)
-            fc_plan.to_excel(writer,"FC Shipment Plan",index=False)
+            report.to_excel(writer,"Main Planning",index=False)
+            dead_stock.to_excel(writer,"Dead Stock",index=False)
+            slow_moving.to_excel(writer,"Slow Moving",index=False)
+            excess_stock.to_excel(writer,"Excess Stock",index=False)
+            state_pivot.to_excel(writer,"State Heatmap")
         output.seek(0)
         return output
 
     st.download_button(
-        "📥 Download Client Ready Report",
+        "📥 Download Full Intelligence Report",
         generate_excel(),
-        "FBA_Supply_Planner_Enterprise.xlsx",
+        "FBA_Supply_Intelligence.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
 else:
-    st.info("Upload Sales and Inventory file to generate planning report.")
+    st.info("Upload Sales and Inventory file to start.")
