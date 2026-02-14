@@ -4,19 +4,31 @@ import numpy as np
 import io
 import zipfile
 from datetime import timedelta
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
 
-st.set_page_config(page_title="FBA Smart Supply Planner", layout="wide")
-st.title("📦 FBA Smart Supply Planner")
+st.set_page_config(page_title="FBA Smart Supply Planner Pro", layout="wide")
+st.title("📦 FBA Smart Supply Planner Pro")
 
-st.markdown("Upload MTR (Sales) + Inventory Ledger")
+st.markdown("Upload Sales (MTR) + Inventory Ledger")
 
 # ================= CLUSTER MAP =================
 cluster_map = {
-    "North": ["UTTAR PRADESH","DELHI","HARYANA","PUNJAB","RAJASTHAN"],
-    "West": ["MAHARASHTRA","GUJARAT"],
-    "South": ["TAMIL NADU","KARNATAKA","KERALA","TELANGANA","ANDHRA PRADESH"],
-    "East": ["WEST BENGAL","ODISHA","ASSAM","BIHAR"],
-    "Central": ["MADHYA PRADESH","CHHATTISGARH"]
+    "North Cluster": ["UTTAR PRADESH","DELHI","HARYANA","PUNJAB","RAJASTHAN"],
+    "West Cluster": ["MAHARASHTRA","GUJARAT"],
+    "South Cluster": ["TAMIL NADU","KARNATAKA","KERALA","TELANGANA","ANDHRA PRADESH"],
+    "East Cluster": ["WEST BENGAL","ODISHA","ASSAM","BIHAR"],
+    "Central Cluster": ["MADHYA PRADESH","CHHATTISGARH"]
+}
+
+fc_map = {
+    "North Cluster": "DEL FC",
+    "West Cluster": "BOM FC",
+    "South Cluster": "BLR FC",
+    "East Cluster": "CCU FC",
+    "Central Cluster": "HYD FC",
+    "Other Cluster": "DEL FC"
 }
 
 # ================= FILE UPLOAD =================
@@ -35,19 +47,13 @@ def read_file(file):
 # ================= MAIN =================
 if mtr_files and inventory_file:
 
-    # ---------- LOAD SALES ----------
     sales = pd.concat([read_file(f) for f in mtr_files], ignore_index=True)
     sales["Quantity"] = pd.to_numeric(sales["Quantity"], errors="coerce").fillna(0)
     sales["Shipment Date"] = pd.to_datetime(sales["Shipment Date"], errors="coerce")
     sales["Ship To State"] = sales["Ship To State"].str.upper()
 
-    # ---------- LOAD INVENTORY ----------
     inv = read_file(inventory_file)
     inv.columns = inv.columns.str.strip()
-
-    if "Ending Warehouse Balance" not in inv.columns:
-        st.error("Inventory Ledger must contain 'Ending Warehouse Balance'")
-        st.stop()
 
     inv["Date"] = pd.to_datetime(inv["Date"], errors="coerce")
     latest_stock = inv.sort_values("Date").groupby("MSKU").tail(1)
@@ -56,116 +62,102 @@ if mtr_files and inventory_file:
     stock.columns = ["Sku","Current Stock"]
     stock["Current Stock"] = pd.to_numeric(stock["Current Stock"], errors="coerce").fillna(0)
 
-    # ---------- SALES SPLIT ----------
+    # ---------- PRODUCT REPORT ----------
     total_sales = sales.groupby("Sku")["Quantity"].sum().reset_index()
-    fba_sales = sales[sales["Fulfillment Channel"]=="AFN"].groupby("Sku")["Quantity"].sum().reset_index()
-    mfn_sales = sales[sales["Fulfillment Channel"]=="MFN"].groupby("Sku")["Quantity"].sum().reset_index()
-
-    # ---------- FORECAST ----------
     max_date = sales["Shipment Date"].max()
     last_30 = sales[sales["Shipment Date"] >= max_date - timedelta(days=30)]
     avg_daily = last_30.groupby("Sku")["Quantity"].sum().reset_index()
-    avg_daily["Avg Daily"] = avg_daily["Quantity"] / 30
+    avg_daily["Avg Daily Sale"] = avg_daily["Quantity"]/30
 
-    # ---------- MERGE PRODUCT REPORT ----------
     report = total_sales.merge(stock,on="Sku",how="left")
-    report = report.merge(fba_sales,on="Sku",how="left",suffixes=("","_FBA"))
-    report = report.merge(mfn_sales,on="Sku",how="left",suffixes=("","_MFN"))
-    report = report.merge(avg_daily[["Sku","Avg Daily"]],on="Sku",how="left")
-
+    report = report.merge(avg_daily[["Sku","Avg Daily Sale"]],on="Sku",how="left")
     report.fillna(0,inplace=True)
 
-    report.rename(columns={
-        "Quantity":"Total Sales",
-        "Quantity_FBA":"FBA Sales",
-        "Quantity_MFN":"MFN Sales"
-    },inplace=True)
+    report["30 Day Forecast"] = report["Avg Daily Sale"]*30
+    report["Days of Cover"] = report["Current Stock"]/report["Avg Daily Sale"].replace(0,1)
+    report["Reorder Qty (45D)"] = ((report["Avg Daily Sale"]*45)-report["Current Stock"]).clip(lower=0)
 
-    report["30D Forecast"] = report["Avg Daily"]*30
-    report["Days of Cover"] = report["Current Stock"] / report["Avg Daily"].replace(0,1)
-    report["Reorder Qty (45D Cover)"] = (report["Avg Daily"]*45) - report["Current Stock"]
-
-    report["Stock Status"] = np.where(
-        report["Days of Cover"]<15,"🔴 Critical",
-        np.where(report["Days of Cover"]<30,"🟠 Warning","🟢 Healthy")
-    )
-
-    # ---------- CLUSTER ASSIGN ----------
+    # ---------- CLUSTER ----------
     def assign_cluster(state):
         for cluster, states in cluster_map.items():
             if state in states:
                 return cluster
-        return "Other"
+        return "Other Cluster"
 
-    sales["Cluster"] = sales["Ship To State"].apply(assign_cluster)
+    sales["Cluster Name"] = sales["Ship To State"].apply(assign_cluster)
 
-    cluster_sales = (
-        sales.groupby(["Sku","Cluster"])["Quantity"]
-        .sum()
-        .reset_index()
-    )
-
+    cluster_sales = sales.groupby(["Sku","Cluster Name"])["Quantity"].sum().reset_index()
     cluster_total = cluster_sales.groupby("Sku")["Quantity"].sum().reset_index()
+
     cluster_sales = cluster_sales.merge(cluster_total,on="Sku",suffixes=("","_Total"))
+    cluster_sales["Cluster %"] = cluster_sales["Quantity"]/cluster_sales["Quantity_Total"]
 
-    cluster_sales["Cluster %"] = cluster_sales["Quantity"] / cluster_sales["Quantity_Total"]
+    cluster_sales = cluster_sales.merge(avg_daily[["Sku","Avg Daily Sale"]],on="Sku",how="left")
+    cluster_sales["Cluster Forecast 30D"] = cluster_sales["Avg Daily Sale"]*30*cluster_sales["Cluster %"]
+    cluster_sales["Suggested Dispatch Qty"] = cluster_sales["Cluster Forecast 30D"]*1.5
 
-    cluster_sales = cluster_sales.merge(avg_daily[["Sku","Avg Daily"]],on="Sku",how="left")
-    cluster_sales["Cluster 30D Forecast"] = cluster_sales["Avg Daily"]*30*cluster_sales["Cluster %"]
+    cluster_sales["Mapped FC"] = cluster_sales["Cluster Name"].map(fc_map)
 
-    cluster_sales["Suggested Send Qty"] = cluster_sales["Cluster 30D Forecast"]*1.5
+    # ---------- FC SHIPMENT PLAN ----------
+    fc_plan = cluster_sales.groupby(["Mapped FC"])["Suggested Dispatch Qty"].sum().reset_index()
 
-    # ---------- KPI DASHBOARD ----------
-    st.subheader("📊 Executive Overview")
-    col1,col2,col3,col4 = st.columns(4)
-    col1.metric("Total Units Sold", int(report["Total Sales"].sum()))
-    col2.metric("Total FBA Sales", int(report["FBA Sales"].sum()))
-    col3.metric("Total MFN Sales", int(report["MFN Sales"].sum()))
-    col4.metric("Current Total Stock", int(report["Current Stock"].sum()))
+    # ---------- DASHBOARD ----------
+    st.subheader("📊 Product Planning")
+    st.dataframe(report, use_container_width=True)
 
-    st.divider()
+    st.subheader("📍 Cluster Allocation Plan")
+    st.dataframe(cluster_sales, use_container_width=True)
 
-    # ---------- CHARTS ----------
+    st.subheader("🏭 FC Shipment Plan")
+    st.dataframe(fc_plan, use_container_width=True)
+
     st.subheader("📈 Sales Trend")
     trend = sales.groupby("Shipment Date")["Quantity"].sum()
     st.line_chart(trend)
-
-    st.subheader("🏆 Top SKUs")
-    top_sku = report.sort_values("Total Sales",ascending=False).head(10)
-    st.bar_chart(top_sku.set_index("Sku")["Total Sales"])
-
-    st.subheader("🚚 FBA vs MFN Comparison")
-    channel_summary = sales.groupby("Fulfillment Channel")["Quantity"].sum()
-    st.bar_chart(channel_summary)
-
-    st.subheader("🌍 Cluster Distribution")
-    cluster_chart = sales.groupby("Cluster")["Quantity"].sum()
-    st.bar_chart(cluster_chart)
-
-    # ---------- TABLES ----------
-    st.subheader("📦 Product Level Intelligence")
-    st.dataframe(report, use_container_width=True)
-
-    st.subheader("📍 Cluster Wise Stock Planning")
-    st.dataframe(cluster_sales, use_container_width=True)
 
     # ---------- EXCEL EXPORT ----------
     def generate_excel():
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            report.to_excel(writer, sheet_name="Product Intelligence", index=False)
-            cluster_sales.to_excel(writer, sheet_name="Cluster Planning", index=False)
-            trend.to_excel(writer, sheet_name="Sales Trend")
-            cluster_chart.to_excel(writer, sheet_name="Cluster Summary")
+            report.to_excel(writer,"Product Planning",index=False)
+            cluster_sales.to_excel(writer,"Cluster Allocation",index=False)
+            fc_plan.to_excel(writer,"FC Shipment Plan",index=False)
+            trend.to_excel(writer,"Sales Trend")
         output.seek(0)
         return output
 
     st.download_button(
-        "📥 Download Full Smart Planner Report",
+        "📥 Download Excel Report",
         generate_excel(),
-        "FBA_Smart_Supply_Planner.xlsx",
+        "FBA_Smart_Supply_Planner_Pro.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
+    # ---------- PDF EXPORT ----------
+    def generate_pdf():
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer)
+        elements = []
+        styles = getSampleStyleSheet()
+
+        elements.append(Paragraph("FBA Smart Supply Planner Report", styles["Heading1"]))
+        elements.append(Spacer(1,12))
+
+        table_data = [report.columns.tolist()] + report.values.tolist()
+        table = Table(table_data)
+        table.setStyle([("GRID",(0,0),(-1,-1),1,colors.grey)])
+        elements.append(table)
+
+        doc.build(elements)
+        buffer.seek(0)
+        return buffer
+
+    st.download_button(
+        "📄 Download Printable PDF Report",
+        generate_pdf(),
+        "FBA_Smart_Supply_Planner_Report.pdf",
+        "application/pdf"
+    )
+
 else:
-    st.info("Upload Sales and Inventory file to start analysis.")
+    st.info("Upload Sales and Inventory file to generate planning report.")
