@@ -14,6 +14,8 @@ st.title("📦 FBA Smart Supply Planner")
 def add_serial(df: pd.DataFrame) -> pd.DataFrame:
     """Add S.No column starting at 1."""
     df = df.copy()
+    if df.empty:
+        return df
     if "S.No" in df.columns:
         df = df.drop(columns=["S.No"])
     df.insert(0, "S.No", range(1, len(df) + 1))
@@ -55,6 +57,7 @@ planning_days = st.slider(
     max_value=180,
     value=60,
     step=1,
+    help="For how many future days you want stock at FBA/FBM."
 )
 
 safety_buffer = st.slider(
@@ -63,11 +66,13 @@ safety_buffer = st.slider(
     max_value=3.0,
     value=1.5,
     step=0.1,
+    help="Higher value = more safety stock (protection against demand spikes)."
 )
 
 planning_basis = st.selectbox(
     "Planning Based On",
     ["Total Sales (full history)", "Last 30 Days", "Last 60 Days", "Last 90 Days"],
+    help="Which sales window should be used to calculate average daily demand."
 )
 
 st.markdown("---")
@@ -107,7 +112,7 @@ if mtr_files and inventory_file:
             st.error(f"Missing column in Sales file: {col}")
             st.stop()
 
-    # Standardize
+    # Standardize types
     sales["Sku"] = sales["Sku"].astype(str).str.strip()
     sales["Quantity"] = pd.to_numeric(sales["Quantity"], errors="coerce").fillna(0)
     sales["Shipment Date"] = pd.to_datetime(sales["Shipment Date"], errors="coerce")
@@ -133,7 +138,7 @@ if mtr_files and inventory_file:
     else:
         sales["Ship From State"] = "UNKNOWN"
 
-    # Optional Fulfillment / Channel (for FBA vs FBM split)
+    # Fulfillment / Channel (FBA vs FBM)
     fulfilment_col = detect_column(
         sales,
         [
@@ -157,10 +162,10 @@ if mtr_files and inventory_file:
         }
         sales["Fulfillment Type"] = raw_fulfil.map(fulfil_map).fillna(raw_fulfil)
     else:
-        # If not present, treat all sales as FBA (typical if only FBA MTR is uploaded)
+        # If field is missing, assume all sales are FBA (common for FBA MTR exports)
         sales["Fulfillment Type"] = "FBA"
 
-    # Remove rows without shipment date
+    # Drop rows without shipment date
     sales = sales.dropna(subset=["Shipment Date"])
     if sales.empty:
         st.error("No valid shipment dates found in Sales file.")
@@ -172,7 +177,7 @@ if mtr_files and inventory_file:
     uploaded_sales_days = (overall_max_date - overall_min_date).days + 1
     uploaded_sales_days = max(uploaded_sales_days, 1)
 
-    # Choose history subset based on planning_basis
+    # Choose history subset for planning
     if planning_basis == "Total Sales (full history)":
         hist_sales_df = sales.copy()
         history_window_days = uploaded_sales_days
@@ -220,7 +225,7 @@ if mtr_files and inventory_file:
         inv["Ending Warehouse Balance"], errors="coerce"
     ).fillna(0)
 
-    # Optional state / warehouse info
+    # Ship From State & Warehouse Code
     inv_ship_from_col = detect_column(
         inv,
         ["Ship From State", "Ship from State", "Warehouse State", "FC State"],
@@ -269,10 +274,10 @@ if mtr_files and inventory_file:
             raw_inv_fulfil
         )
     else:
-        # If ledger is FBA-only (common case), mark all as FBA
+        # If ledger export is FBA-only, consider all as FBA
         inv["Fulfillment Type"] = "FBA"
 
-    # ---------- STOCK BY SKU (AGGREGATE) ----------
+    # ---------- GLOBAL STOCK BY SKU ----------
     sku_stock = (
         inv.groupby(inventory_key_col)["Ending Warehouse Balance"]
         .sum()
@@ -281,13 +286,13 @@ if mtr_files and inventory_file:
     sku_stock.rename(
         columns={
             inventory_key_col: "Sku",
-            "Ending Warehouse Balance": "Current Stock",
+            "Ending Warehouse Balance": "Current Stock (All)",
         },
         inplace=True,
     )
     sku_stock["Sku"] = sku_stock["Sku"].astype(str).str.strip()
 
-    # ---------- STOCK BY STATE / WAREHOUSE & FULFILLMENT ----------
+    # ---------- STOCK BY SITE (SKU + FT + STATE + WAREHOUSE) ----------
     stock_by_site = (
         inv.groupby(
             [inventory_key_col, "Fulfillment Type", "Ship From State", "Warehouse Code"]
@@ -304,149 +309,149 @@ if mtr_files and inventory_file:
     )
     stock_by_site["Sku"] = stock_by_site["Sku"].astype(str).str.strip()
 
-    # Also an aggregate by Sku + Fulfillment Type
+    # ---------- STOCK BY SKU + FULFILLMENT TYPE ----------
     stock_by_ft = (
         stock_by_site.groupby(["Sku", "Fulfillment Type"])["Current Stock"]
         .sum()
         .reset_index()
-        .rename(columns={"Current Stock": "Current Stock (FT)"})
+        .rename(columns={"Current Stock": "Current Stock (Channel)"})
     )
 
-    # ---------- PRODUCT-LEVEL DEMAND (HISTORY WINDOW) ----------
-    hist_total_sales = (
-        hist_sales_df.groupby("Sku")["Quantity"]
+    # ---------- DEMAND BY SKU + FULFILLMENT TYPE ----------
+    # Total history sales for chosen window per SKU + channel
+    hist_sales_ft = (
+        hist_sales_df.groupby(["Sku", "Fulfillment Type"])["Quantity"]
         .sum()
         .reset_index()
-        .rename(columns={"Quantity": "History Sales"})
+        .rename(columns={"Quantity": "History Sales (Channel)"})
     )
 
-    # For reference: total sales over full uploaded window
-    full_total_sales = (
-        sales.groupby("Sku")["Quantity"]
+    # Full uploaded sales (for information only, not used in calc)
+    full_sales_ft = (
+        sales.groupby(["Sku", "Fulfillment Type"])["Quantity"]
         .sum()
         .reset_index()
-        .rename(columns={"Quantity": "Total Sales (Uploaded)"})
+        .rename(columns={"Quantity": "Total Sales (Uploaded, Channel)"})
     )
 
-    report = hist_total_sales.merge(full_total_sales, on="Sku", how="left")
-    report = report.merge(sku_stock, on="Sku", how="left")
-    report["Current Stock"] = report["Current Stock"].fillna(0)
-
-    # Two planning columns (explicit requirement)
-    report["Sales Data Days (Uploaded)"] = float(uploaded_sales_days)
-    report["Planning Period Days"] = float(planning_days)
-
-    # History window actually used for averages
-    report["History Window Days (Used)"] = float(history_window_days)
-    report["Avg Daily Sale"] = (
-        report["History Sales"] / report["History Window Days (Used)"]
-    )
-
-    # ---------- DEMAND VOLATILITY & SAFETY STOCK ----------
-    daily_sales = (
-        hist_sales_df.groupby(["Sku", "Shipment Date"])["Quantity"]
+    # Daily sales per SKU + FT to get channel‑level volatility
+    daily_sales_ft = (
+        hist_sales_df.groupby(["Sku", "Fulfillment Type", "Shipment Date"])["Quantity"]
         .sum()
         .reset_index()
     )
-
-    std_dev = (
-        daily_sales.groupby("Sku")["Quantity"]
+    std_dev_ft = (
+        daily_sales_ft.groupby(["Sku", "Fulfillment Type"])["Quantity"]
         .std()
         .reset_index()
-        .rename(columns={"Quantity": "Demand StdDev"})
+        .rename(columns={"Quantity": "Demand StdDev (Channel)"})
     )
 
-    report = report.merge(std_dev, on="Sku", how="left")
-    report["Demand StdDev"] = (
-        pd.to_numeric(report["Demand StdDev"], errors="coerce").fillna(0.0)
+    # ---------- BUILD CHANNEL‑LEVEL PLANNING TABLE ----------
+    plan_ft = hist_sales_ft.merge(full_sales_ft, on=["Sku", "Fulfillment Type"], how="left")
+    plan_ft = plan_ft.merge(stock_by_ft, on=["Sku", "Fulfillment Type"], how="left")
+    plan_ft = plan_ft.merge(std_dev_ft, on=["Sku", "Fulfillment Type"], how="left")
+
+    plan_ft["Current Stock (Channel)"] = plan_ft["Current Stock (Channel)"].fillna(0)
+    plan_ft["Demand StdDev (Channel)"] = pd.to_numeric(
+        plan_ft["Demand StdDev (Channel)"], errors="coerce"
+    ).fillna(0.0)
+
+    # Planning windows (same for all rows)
+    plan_ft["Sales Data Days (Uploaded)"] = float(uploaded_sales_days)
+    plan_ft["History Window Days (Used)"] = float(history_window_days)
+    plan_ft["Planning Period Days"] = float(planning_days)
+
+    # Average daily demand per channel
+    plan_ft["Avg Daily Sale (Channel)"] = (
+        plan_ft["History Sales (Channel)"] / plan_ft["History Window Days (Used)"]
     )
 
-    # Safety stock using safety_buffer as Z‑factor: SS = k * σ * sqrt(T)
-    report["Safety Stock"] = (
+    # Safety stock per SKU + channel
+    # SS = safety_buffer * σ_channel * sqrt(planning_days)
+    plan_ft["Safety Stock (Channel)"] = (
         safety_buffer
-        * report["Demand StdDev"]
+        * plan_ft["Demand StdDev (Channel)"]
         * math.sqrt(float(planning_days))
     )
 
-    # Required stock & recommendation (global per SKU)
-    report["Base Requirement"] = report["Avg Daily Sale"] * float(planning_days)
-    report["Required Stock"] = report["Base Requirement"] + report["Safety Stock"]
-
-    report["Recommended Dispatch Qty"] = (
-        report["Required Stock"] - report["Current Stock"]
-    ).clip(lower=0).round(0)
-
-    # Days of cover on current stock
-    report["Days of Cover"] = (
-        report["Current Stock"] / report["Avg Daily Sale"].replace(0, 1)
+    # Required stock per channel
+    plan_ft["Base Requirement (Channel)"] = (
+        plan_ft["Avg Daily Sale (Channel)"] * float(planning_days)
+    )
+    plan_ft["Required Stock (Channel)"] = (
+        plan_ft["Base Requirement (Channel)"] + plan_ft["Safety Stock (Channel)"]
     )
 
-    # Health classification
-    def classify_row(row):
-        if row["Avg Daily Sale"] <= 0 and row["Current Stock"] > 0:
+    # Recommended dispatch per channel (this fixes the earlier issue:
+    # we now compare required vs current stock only within that channel)
+    plan_ft["Recommended Dispatch (Channel)"] = (
+        plan_ft["Required Stock (Channel)"] - plan_ft["Current Stock (Channel)"]
+    ).clip(lower=0).round(0)
+
+    # Days of cover per channel
+    plan_ft["Days of Cover (Channel)"] = (
+        plan_ft["Current Stock (Channel)"]
+        / plan_ft["Avg Daily Sale (Channel)"].replace(0, 1)
+    )
+
+    # Health tag by channel
+    def classify_channel(row):
+        if row["Avg Daily Sale (Channel)"] <= 0 and row["Current Stock (Channel)"] > 0:
             return "Dead / No Sales"
-        if row["Days of Cover"] < planning_days * 0.5:
+        if row["Days of Cover (Channel)"] < planning_days * 0.5:
             return "At Risk (Low Stock)"
-        if row["Days of Cover"] > planning_days * 2:
+        if row["Days of Cover (Channel)"] > planning_days * 2:
             return "Excess / Slow"
         return "Healthy"
 
-    report["Health Tag"] = report.apply(classify_row, axis=1)
+    plan_ft["Health Tag"] = plan_ft.apply(classify_channel, axis=1)
 
-    report = add_serial(report)
-    preferred_order = [
+    plan_ft = add_serial(plan_ft)
+
+    channel_order = [
         "S.No",
         "Sku",
+        "Fulfillment Type",
         "Health Tag",
-        "History Sales",
-        "Total Sales (Uploaded)",
+        "History Sales (Channel)",
+        "Total Sales (Uploaded, Channel)",
         "Sales Data Days (Uploaded)",
         "History Window Days (Used)",
         "Planning Period Days",
-        "Avg Daily Sale",
-        "Demand StdDev",
-        "Safety Stock",
-        "Base Requirement",
-        "Required Stock",
-        "Current Stock",
-        "Recommended Dispatch Qty",
-        "Days of Cover",
+        "Avg Daily Sale (Channel)",
+        "Demand StdDev (Channel)",
+        "Safety Stock (Channel)",
+        "Base Requirement (Channel)",
+        "Required Stock (Channel)",
+        "Current Stock (Channel)",
+        "Recommended Dispatch (Channel)",
+        "Days of Cover (Channel)",
     ]
-    existing = [c for c in preferred_order if c in report.columns]
-    rest = [c for c in report.columns if c not in existing]
-    report = report[existing + rest]
+    existing_cols = [c for c in channel_order if c in plan_ft.columns]
+    other_cols = [c for c in plan_ft.columns if c not in existing_cols]
+    plan_ft = plan_ft[existing_cols + other_cols]
 
-    # ---------- DEAD STOCK ----------
-    last_sale = (
-        sales.groupby("Sku")["Shipment Date"]
-        .max()
+    # Separate FBA and FBM views
+    fba_plan = plan_ft[plan_ft["Fulfillment Type"] == "FBA"].copy()
+    fbm_plan = plan_ft[plan_ft["Fulfillment Type"] == "FBM"].copy()
+
+    # ---------- COMBINED SKU SUMMARY (ALL CHANNELS) ----------
+    # For quick high‑level view by SKU, sum across channels
+    summary_sku = (
+        plan_ft.groupby("Sku")
+        .agg(
+            Channels=("Fulfillment Type", lambda x: ", ".join(sorted(set(x)))),
+            Total_History_Sales=("History Sales (Channel)", "sum"),
+            Total_Current_Stock=("Current Stock (Channel)", "sum"),
+        )
         .reset_index()
-        .rename(columns={"Shipment Date": "Last Shipment Date"})
     )
-    last_sale["Days Since Last Sale"] = (
-        overall_max_date - last_sale["Last Shipment Date"]
-    ).dt.days
+    summary_sku = summary_sku.merge(sku_stock, on="Sku", how="left")
+    summary_sku["Current Stock (All)"] = summary_sku["Current Stock (All)"].fillna(0)
+    summary_sku = add_serial(summary_sku)
 
-    dead_stock = last_sale.merge(sku_stock, on="Sku", how="left")
-    dead_stock["Current Stock"] = dead_stock["Current Stock"].fillna(0)
-
-    dead_stock = dead_stock[
-        (dead_stock["Days Since Last Sale"] > 60)
-        & (dead_stock["Current Stock"] > 0)
-    ].copy()
-    if not dead_stock.empty:
-        dead_stock = add_serial(dead_stock)
-
-    # ---------- SLOW / EXCESS STOCK ----------
-    slow_moving = report[report["Days of Cover"] > 90].copy()
-    if not slow_moving.empty:
-        slow_moving = add_serial(slow_moving)
-
-    excess_stock = report[report["Days of Cover"] > (planning_days * 2)].copy()
-    if not excess_stock.empty:
-        excess_stock = add_serial(excess_stock)
-
-    # ---------- STATE-LEVEL SALES ----------
+    # ---------- STATE‑LEVEL SALES ----------
     state_summary_to = (
         sales.groupby("Ship To State")["Quantity"]
         .sum()
@@ -465,132 +470,103 @@ if mtr_files and inventory_file:
     )
     state_summary_from = add_serial(state_summary_from)
 
-    # ---------- DEMAND BY FULFILLMENT TYPE (FBA vs FBM) ----------
-    demand_ft = (
-        hist_sales_df.groupby(["Sku", "Fulfillment Type"])["Quantity"]
+    # ---------- MULTI‑WAREHOUSE DIAGNOSTIC ----------
+    # Use demand per site (if Ship From State present in MTR) to compute local days of cover
+    site_sales = (
+        hist_sales_df.groupby(
+            ["Sku", "Fulfillment Type", "Ship From State"]
+        )["Quantity"]
         .sum()
         .reset_index()
-        .rename(columns={"Quantity": "History Sales (FT)"})
+        .rename(columns={"Quantity": "History Sales (Site)"})
+    )
+    site_sales["Avg Daily Sale (Site)"] = (
+        site_sales["History Sales (Site)"] / float(history_window_days)
     )
 
-    total_hist_per_sku = (
-        demand_ft.groupby("Sku")["History Sales (FT)"]
-        .sum()
-        .reset_index()
-        .rename(columns={"History Sales (FT)": "Total History Sales"})
+    site_plan = stock_by_site.merge(
+        site_sales, on=["Sku", "Fulfillment Type", "Ship From State"], how="left"
+    )
+    site_plan["History Sales (Site)"] = site_plan["History Sales (Site)"].fillna(0)
+    site_plan["Avg Daily Sale (Site)"] = site_plan["Avg Daily Sale (Site)"].fillna(0)
+
+    site_plan["Days of Cover (Site)"] = (
+        site_plan["Current Stock"]
+        / site_plan["Avg Daily Sale (Site)"].replace(0, 1)
     )
 
-    demand_ft = demand_ft.merge(total_hist_per_sku, on="Sku", how="left")
-    demand_ft["Demand Share (FT)"] = np.where(
-        demand_ft["Total History Sales"] > 0,
-        demand_ft["History Sales (FT)"] / demand_ft["Total History Sales"],
-        0.0,
+    site_plan = add_serial(site_plan)
+
+    # ---------- RISK TABLES ----------
+    dead_stock = plan_ft[
+        (plan_ft["Avg Daily Sale (Channel)"] == 0)
+        & (plan_ft["Current Stock (Channel)"] > 0)
+    ].copy()
+    dead_stock = add_serial(dead_stock)
+
+    slow_moving = plan_ft[plan_ft["Days of Cover (Channel)"] > 90].copy()
+    slow_moving = add_serial(slow_moving)
+
+    excess_stock = plan_ft[plan_ft["Days of Cover (Channel)"] > (planning_days * 2)].copy()
+    excess_stock = add_serial(excess_stock)
+
+    # ================== UI TABS ==================
+    tab_fba, tab_fbm, tab_all, tab_sites, tab_risk = st.tabs(
+        ["FBA Planning", "FBM Planning", "All Channels Summary", "Warehouses / States", "Risk Alerts"]
     )
 
-    # Attach SKU-level required stock and compute allocation per fulfillment type
-    demand_ft = demand_ft.merge(
-        report[["Sku", "Required Stock"]], on="Sku", how="left"
-    )
-    demand_ft["Allocated Required Stock (FT)"] = (
-        demand_ft["Required Stock"] * demand_ft["Demand Share (FT)"]
-    )
+    with tab_fba:
+        st.subheader("📦 FBA Planning (per SKU)")
+        st.dataframe(fba_plan, use_container_width=True)
 
-    # FBA / FBM summary per SKU
-    fba_fbm_summary = (
-        demand_ft.groupby(["Sku", "Fulfillment Type"])
-        .agg(
-            History_Sales_FT=("History Sales (FT)", "sum"),
-            Demand_Share_FT=("Demand Share (FT)", "mean"),
-            Required_Stock_FT=("Allocated Required Stock (FT)", "sum"),
+    with tab_fbm:
+        st.subheader("📮 FBM Planning (per SKU)")
+        st.dataframe(fbm_plan, use_container_width=True)
+
+    with tab_all:
+        st.subheader("📊 Combined SKU Overview (All Channels)")
+        st.dataframe(summary_sku, use_container_width=True)
+        st.caption(
+            "This table shows total history sales and total stock across FBA + FBM. "
+            "Use FBA/FBM tabs for channel‑specific dispatch recommendations."
         )
-        .reset_index()
-    )
 
-    fba_fbm_summary = fba_fbm_summary.merge(
-        stock_by_ft, on=["Sku", "Fulfillment Type"], how="left"
-    )
-    fba_fbm_summary["Current Stock (FT)"] = fba_fbm_summary[
-        "Current Stock (FT)"
-    ].fillna(0)
+    with tab_sites:
+        st.subheader("🏭 Stock by Warehouse / State (FBA & FBM)")
+        st.dataframe(site_plan, use_container_width=True)
 
-    fba_fbm_summary["Recommended Dispatch (FT)"] = (
-        fba_fbm_summary["Required_Stock_FT"]
-        - fba_fbm_summary["Current Stock (FT)"]
-    ).clip(lower=0).round(0)
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("🌍 State Sales – Ship To State")
+            st.dataframe(state_summary_to, use_container_width=True)
+        with col2:
+            st.subheader("🚚 State Sales – Ship From State")
+            st.dataframe(state_summary_from, use_container_width=True)
 
-    fba_fbm_summary = add_serial(fba_fbm_summary)
+    with tab_risk:
+        st.subheader("🔥 Dead / Zero‑Velocity Stock (Channel Level)")
+        st.dataframe(dead_stock, use_container_width=True)
 
-    # ---------- MULTI-WAREHOUSE PLAN (SKU + FT + SITE) ----------
-    multi_wh_plan = stock_by_site.merge(
-        demand_ft[
-            ["Sku", "Fulfillment Type", "Allocated Required Stock (FT)"]
-        ],
-        on=["Sku", "Fulfillment Type"],
-        how="left",
-    )
+        st.subheader("🟡 Slow Moving (Cover > 90 Days)")
+        st.dataframe(slow_moving, use_container_width=True)
 
-    multi_wh_plan["Allocated Required Stock (FT)"] = multi_wh_plan[
-        "Allocated Required Stock (FT)"
-    ].fillna(0.0)
-
-    multi_wh_plan["Recommended Dispatch (Site)"] = (
-        multi_wh_plan["Allocated Required Stock (FT)"]
-        - multi_wh_plan["Current Stock"]
-    ).clip(lower=0).round(0)
-
-    multi_wh_plan = add_serial(multi_wh_plan)
-
-    # ================== DISPLAY ==================
-    st.subheader("📊 Main Planning Report (SKU Level)")
-    st.dataframe(report, use_container_width=True)
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("🌍 State Sales – Ship To State")
-        st.dataframe(state_summary_to, use_container_width=True)
-    with col2:
-        st.subheader("🏭 State Sales – Ship From State")
-        st.dataframe(state_summary_from, use_container_width=True)
-
-    st.subheader("🏬 FBA / FBM Summary by SKU & Fulfillment Type")
-    st.dataframe(fba_fbm_summary, use_container_width=True)
-
-    st.subheader("📦 Multi‑Warehouse Plan (Per Site & Fulfillment Type)")
-    st.dataframe(multi_wh_plan, use_container_width=True)
-
-    st.subheader("🏷️ Stock by State / Warehouse (Raw Inventory View)")
-    st.dataframe(add_serial(stock_by_site.copy()), use_container_width=True)
-
-    st.subheader("🔥 Dead Stock (No Sale > 60 Days)")
-    st.dataframe(dead_stock, use_container_width=True)
-
-    st.subheader("🟡 Slow Moving SKUs (Cover > 90 Days)")
-    st.dataframe(slow_moving, use_container_width=True)
-
-    st.subheader("🔵 Excess Stock (Cover > 2 × Planning Days)")
-    st.dataframe(excess_stock, use_container_width=True)
+        st.subheader("🔵 Excess Stock (Cover > 2 × Planning Days)")
+        st.dataframe(excess_stock, use_container_width=True)
 
     # ================== EXCEL EXPORT ==================
     def generate_excel():
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            report.to_excel(writer, "Main Planning", index=False)
-            dead_stock.to_excel(writer, "Dead Stock", index=False)
-            slow_moving.to_excel(writer, "Slow Moving", index=False)
-            excess_stock.to_excel(writer, "Excess Stock", index=False)
-            state_summary_to.to_excel(writer, "State Sales - Ship To", index=False)
-            state_summary_from.to_excel(
-                writer, "State Sales - Ship From", index=False
-            )
-            fba_fbm_summary.to_excel(
-                writer, "FBA_FBM by SKU", index=False
-            )
-            multi_wh_plan.to_excel(
-                writer, "Multi-WH Plan (Site)", index=False
-            )
-            stock_by_site.to_excel(
-                writer, "Stock by Site (Raw)", index=False
-            )
+            plan_ft.to_excel(writer, "Planning_All_Channels", index=False)
+            fba_plan.to_excel(writer, "Planning_FBA", index=False)
+            fbm_plan.to_excel(writer, "Planning_FBM", index=False)
+            summary_sku.to_excel(writer, "Summary_SKU_All", index=False)
+            site_plan.to_excel(writer, "Warehouse_State_View", index=False)
+            state_summary_to.to_excel(writer, "State_Sales_ShipTo", index=False)
+            state_summary_from.to_excel(writer, "State_Sales_ShipFrom", index=False)
+            dead_stock.to_excel(writer, "Risk_Dead", index=False)
+            slow_moving.to_excel(writer, "Risk_Slow", index=False)
+            excess_stock.to_excel(writer, "Risk_Excess", index=False)
         output.seek(0)
         return output
 
