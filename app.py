@@ -9,25 +9,31 @@ import math
 st.set_page_config(page_title="FBA Smart Supply Planner", layout="wide")
 st.title("📦 FBA Smart Supply Planner")
 
-# ================== FC NAME MAPPING (CUSTOMISE AS NEEDED) ==================
+# ================== FC NAME MAPPING (EXTEND AS NEEDED) ==================
 FC_NAMES = {
-    'DEL4': 'Delhi North FC',
-    'DEL5': 'Delhi North FC',
-    'DEX3': 'New Delhi FC',
-    'PNQ2': 'Delhi City FC',
-    'BOM1': 'Bhiwandi Mumbai FC',
-    'BOM3': 'Nashik FC',
-    'BOM4': 'Vasai FC',
-    'SAMB': 'Mumbai West FC',
-    'BLR5': 'Bangalore South FC',
-    'SCJA': 'Bangalore FC',
-    'XSAB': 'Bangalore XS FC',
-    'SBLA': 'Bangalore SBLA FC',
-    'MAA4': 'Chennai South FC',
-    'MAA5': 'Chennai South FC',
-    'SMAB': 'Chennai SMAB FC',
-    'HYD7': 'Hyderabad South FC',
-    'HYD8': 'Hyderabad South FC',
+    # Delhi / North cluster
+    "DEX3": "New Delhi FC (DEX3)",
+    "DEX8": "New Delhi FC (DEX8)",
+    "DEL4": "Delhi North FC (DEL4)",
+    "DEL5": "Delhi North FC (DEL5)",
+    "PNQ2": "Delhi City FC (PNQ2)",
+
+    # West / Maharashtra
+    "BOM1": "Bhiwandi Mumbai FC (BOM1)",
+    "BOM3": "Nashik FC (BOM3)",
+    "BOM4": "Vasai FC (BOM4)",
+    "SAMB": "Mumbai West FC (SAMB)",
+
+    # South / Karnataka / TN / Telangana
+    "BLR5": "Bangalore South FC (BLR5)",
+    "SCJA": "Bangalore FC (SCJA)",
+    "XSAB": "Bangalore XS FC (XSAB)",
+    "SBLA": "Bangalore SBLA FC (SBLA)",
+    "MAA4": "Chennai South FC (MAA4)",
+    "MAA5": "Chennai South FC (MAA5)",
+    "SMAB": "Chennai SMAB FC (SMAB)",
+    "HYD7": "Hyderabad South FC (HYD7)",
+    "HYD8": "Hyderabad South FC (HYD8)",
 }
 
 
@@ -311,13 +317,16 @@ if mtr_files and inventory_file:
         inv.groupby("Sku")["Ending Warehouse Balance"]
         .sum()
         .reset_index()
-        .rename(columns={"Ending Warehouse Balance": "Current Stock (All)"}))
+        .rename(columns={"Ending Warehouse Balance": "Current Stock (All)"})
+    )
+
     # Stock per SKU + Channel
     stock_by_ft = (
         inv.groupby(["Sku", "Fulfillment Type"])["Ending Warehouse Balance"]
         .sum()
         .reset_index()
-        .rename(columns={"Ending Warehouse Balance": "Current Stock (Channel)"}))
+        .rename(columns={"Ending Warehouse Balance": "Current Stock (Channel)"})
+    )
 
     # Stock per site (SKU + FT + State + Warehouse)
     stock_by_site = (
@@ -326,8 +335,8 @@ if mtr_files and inventory_file:
         )["Ending Warehouse Balance"]
         .sum()
         .reset_index()
-        .rename(columns={"Ending Warehouse Balance": "Current Stock"}))
-
+        .rename(columns={"Ending Warehouse Balance": "Current Stock"})
+    )
     stock_by_site["FC Name"] = stock_by_site["Warehouse Code"].apply(fc_display_name)
 
     # ---------- DEMAND BY SKU + CHANNEL ----------
@@ -335,29 +344,33 @@ if mtr_files and inventory_file:
         hist_sales_df.groupby(["Sku", "Fulfillment Type"])["Quantity"]
         .sum()
         .reset_index()
-        .rename(columns={"Quantity": "History Sales (Channel)"}))
+        .rename(columns={"Quantity": "History Sales (Channel)"})
+    )
 
     full_sales_ft = (
         sales.groupby(["Sku", "Fulfillment Type"])["Quantity"]
         .sum()
         .reset_index()
-        .rename(columns={"Quantity": "Total Sales (Uploaded, Channel)"}))
+        .rename(columns={"Quantity": "Total Sales (Uploaded, Channel)"})
+    )
 
     daily_sales_ft = (
         hist_sales_df.groupby(
             ["Sku", "Fulfillment Type", "Shipment Date"]
         )["Quantity"]
         .sum()
-        .reset_index())
+        .reset_index()
+    )
 
     std_dev_ft = (
         daily_sales_ft.groupby(["Sku", "Fulfillment Type"])["Quantity"]
         .std()
         .reset_index()
-        .rename(columns={"Quantity": "Demand StdDev (Channel)"}))
+        .rename(columns={"Quantity": "Demand StdDev (Channel)"})
+    )
 
     # ---------- BUILD CHANNEL-LEVEL PLANNING TABLE ----------
-    # Start from union of keys from sales and inventory
+    # Keys union from sales and inventory
     base_keys = pd.concat(
         [
             hist_sales_ft[["Sku", "Fulfillment Type"]],
@@ -426,16 +439,6 @@ if mtr_files and inventory_file:
     fbm_plan = plan_ft[plan_ft["Fulfillment Type"] == "FBM"].copy()
 
     # ---------- SITE-LEVEL DEMAND & FC-WISE RECOMMENDATION ----------
-    # Demand per site (using Ship To State as proxy; if Ship From available, you can switch)
-    site_sales = (
-        hist_sales_df.groupby(["Sku", "Fulfillment Type", "Ship To State"])["Quantity"]
-        .sum()
-        .reset_index()
-        .rename(columns={"Quantity": "History Sales (Site)"})
-    )
-
-    # Map Ship To State onto inventory Ship From State if possible (approximate).
-    # For now we aggregate sales by (Sku, FT, Ship From State) from MTR if exists.
     if "Ship From State" in hist_sales_df.columns:
         site_sales_from = (
             hist_sales_df.groupby(
@@ -450,7 +453,6 @@ if mtr_files and inventory_file:
             columns=["Sku", "Fulfillment Type", "Ship From State", "History Sales (Site)"]
         )
 
-    # Build site plan from inventory sites
     site_plan = stock_by_site.merge(
         site_sales_from,
         on=["Sku", "Fulfillment Type", "Ship From State"],
@@ -460,12 +462,10 @@ if mtr_files and inventory_file:
     site_plan["Avg Daily Sale (Site)"] = (
         site_plan["History Sales (Site)"] / float(history_window_days)
     )
-
     site_plan["Days of Cover (Site)"] = (
         site_plan["Current Stock"] / site_plan["Avg Daily Sale (Site)"].replace(0, 1)
     )
 
-    # Attach channel-level recommended dispatch to every site row
     site_plan = site_plan.merge(
         plan_ft[
             ["Sku", "Fulfillment Type", "Recommended Dispatch (Channel)",
@@ -475,24 +475,19 @@ if mtr_files and inventory_file:
         how="left",
     )
 
-    # Compute demand share per site and allocate recommended dispatch
     temp = site_plan.groupby(["Sku", "Fulfillment Type"])["History Sales (Site)"].sum().reset_index()
     temp.rename(columns={"History Sales (Site)": "Total Site History Sales"}, inplace=True)
     site_plan = site_plan.merge(
         temp, on=["Sku", "Fulfillment Type"], how="left"
     )
 
-    # If no site-level history (0), fall back to equal allocation across sites for that SKU+FT
     def compute_share(row):
         if row["Total Site History Sales"] > 0:
             return row["History Sales (Site)"] / row["Total Site History Sales"]
         else:
-            # equal split among sites for this SKU+FT
             return np.nan
 
     site_plan["Demand Share (Site)"] = site_plan.apply(compute_share, axis=1)
-
-    # If NaN (no history), equal split
     count_sites = (
         site_plan.groupby(["Sku", "Fulfillment Type"])["Warehouse Code"]
         .transform("count")
