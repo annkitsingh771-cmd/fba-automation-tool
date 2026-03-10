@@ -1,185 +1,210 @@
 """
-FBA Smart Supply Planner
-========================
+FBA Smart Supply Planner  ·  Amazon India Edition
+==================================================
 Upload:
   1. Amazon Inventory Ledger  (CSV / ZIP / XLSX)
-  2. MTR Sales Report         (CSV / ZIP / XLSX, multiple files OK)
-
-Outputs:
-  - FBA / FBM dispatch plan with safety stock & priority scores
-  - FC-wise & cluster-wise allocation
-  - Risk alerts (critical / dead / slow / excess)
-  - Damaged stock report
-  - Amazon FBA flat file for bulk shipment creation
-  - Full Excel intelligence report
+  2. MTR Sales Report         (CSV / ZIP / XLSX — multiple files OK)
 """
 
-import math
-import io
-import zipfile
+import math, io, zipfile
 from datetime import datetime, timedelta
-
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
 # PAGE CONFIG
-# ──────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="FBA Smart Supply Planner",
-    layout="wide",
-    page_icon="📦",
-)
-
-st.markdown(
-    """
+# ─────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="FBA Smart Supply Planner", layout="wide", page_icon="📦")
+st.markdown("""
 <style>
-    [data-testid="stMetricValue"] { font-size: 1.55rem; font-weight: 700; }
-    .pill-red    { display:inline-block; background:#fed7d7; color:#9b2c2c;
-                   border-radius:12px; padding:2px 10px; font-size:12px; font-weight:700; }
-    .pill-green  { display:inline-block; background:#c6f6d5; color:#276221;
-                   border-radius:12px; padding:2px 10px; font-size:12px; font-weight:700; }
-    .pill-yellow { display:inline-block; background:#fefcbf; color:#744210;
-                   border-radius:12px; padding:2px 10px; font-size:12px; font-weight:700; }
-    .alert-red    { background:#fff5f5; border-left:4px solid #e53e3e; color:#742a2a;
-                    padding:.65rem 1rem; border-radius:6px; margin:.35rem 0; font-weight:600; }
-    .alert-yellow { background:#fffff0; border-left:4px solid #d69e2e; color:#744210;
-                    padding:.65rem 1rem; border-radius:6px; margin:.35rem 0; font-weight:600; }
-    .alert-green  { background:#f0fff4; border-left:4px solid #38a169; color:#1c4532;
-                    padding:.65rem 1rem; border-radius:6px; margin:.35rem 0; font-weight:600; }
-    .stTabs [data-baseweb="tab"] { font-size:13px; font-weight:600; }
-    div[data-testid="stExpander"] summary { font-weight:600; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
+[data-testid="stMetricValue"]{font-size:1.55rem;font-weight:700}
+.ab{padding:.6rem 1rem;border-radius:6px;margin:.3rem 0;font-weight:600}
+.ab-r{background:#fff5f5;border-left:4px solid #e53e3e;color:#742a2a}
+.ab-y{background:#fffff0;border-left:4px solid #d69e2e;color:#744210}
+.ab-g{background:#f0fff4;border-left:4px solid #38a169;color:#1c4532}
+.stTabs [data-baseweb="tab"]{font-size:13px;font-weight:600}
+</style>""", unsafe_allow_html=True)
 
-st.title("📦 FBA Smart Supply Planner")
-st.caption(
-    "Amazon Inventory Ledger + MTR Sales → Dispatch plan · FC allocation · Risk alerts · Amazon flat file"
-)
+st.title("📦 FBA Smart Supply Planner — Amazon India")
+st.caption("Inventory Ledger + MTR Sales → Dispatch plan · FC-wise allocation · Risk alerts · Amazon flat file")
 
-# ──────────────────────────────────────────────────────────────
-# FC MASTER  (Amazon India)
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# COMPLETE AMAZON INDIA FC MASTER  (75 codes — verified)
+# Tuple: (FC Full Name, City, Area/Locality, State, Cluster)
+#
+# KEY NOTES:
+#   PNQ2        → New Delhi (Mohan Co-op A-33), NOT Pune
+#   PNQ1/PNQ3   → Pune Hinjewadi / Chakan
+#   DEL8_DED5   → single FC in Sohna, Haryana
+#   HYD8_HYD3   → single FC in Shamshabad, Telangana
+# ─────────────────────────────────────────────────────────────────
 FC_DATA = {
-    # Delhi NCR
-    "DEX3": {"name": "New Delhi FC (DEX3)",       "city": "New Delhi",  "state": "DELHI",          "cluster": "Delhi NCR"},
-    "DEX8": {"name": "New Delhi FC (DEX8)",       "city": "New Delhi",  "state": "DELHI",          "cluster": "Delhi NCR"},
-    "DEL4": {"name": "Delhi North FC (DEL4)",     "city": "Delhi",      "state": "DELHI",          "cluster": "Delhi NCR"},
-    "DEL5": {"name": "Delhi North FC (DEL5)",     "city": "Delhi",      "state": "DELHI",          "cluster": "Delhi NCR"},
-    "DEL6": {"name": "Manesar FC (DEL6)",         "city": "Manesar",    "state": "HARYANA",        "cluster": "Delhi NCR"},
-    "DEL7": {"name": "Bilaspur FC (DEL7)",        "city": "Bilaspur",   "state": "HARYANA",        "cluster": "Delhi NCR"},
-    "XDEL": {"name": "Delhi XL FC (XDEL)",        "city": "New Delhi",  "state": "DELHI",          "cluster": "Delhi NCR"},
-    # North
-    "LDH1": {"name": "Ludhiana FC (LDH1)",        "city": "Ludhiana",   "state": "PUNJAB",         "cluster": "North"},
-    "JAI1": {"name": "Jaipur FC (JAI1)",          "city": "Jaipur",     "state": "RAJASTHAN",      "cluster": "North"},
-    "LKO1": {"name": "Lucknow FC (LKO1)",         "city": "Lucknow",    "state": "UTTAR PRADESH",  "cluster": "North"},
-    "AGR1": {"name": "Agra FC (AGR1)",            "city": "Agra",       "state": "UTTAR PRADESH",  "cluster": "North"},
-    # Mumbai / West
-    "BOM1": {"name": "Bhiwandi FC (BOM1)",        "city": "Bhiwandi",   "state": "MAHARASHTRA",    "cluster": "Mumbai West"},
-    "BOM3": {"name": "Nashik FC (BOM3)",          "city": "Nashik",     "state": "MAHARASHTRA",    "cluster": "Mumbai West"},
-    "BOM4": {"name": "Vasai FC (BOM4)",           "city": "Vasai",      "state": "MAHARASHTRA",    "cluster": "Mumbai West"},
-    "BOM5": {"name": "Bhiwandi 2 FC (BOM5)",      "city": "Bhiwandi",   "state": "MAHARASHTRA",    "cluster": "Mumbai West"},
-    "SAMB": {"name": "Mumbai West FC (SAMB)",     "city": "Mumbai",     "state": "MAHARASHTRA",    "cluster": "Mumbai West"},
-    "PNQ1": {"name": "Pune FC (PNQ1)",            "city": "Pune",       "state": "MAHARASHTRA",    "cluster": "Mumbai West"},
-    "PNQ2": {"name": "Pune FC (PNQ2)",            "city": "Pune",       "state": "MAHARASHTRA",    "cluster": "Mumbai West"},
-    "XBOM": {"name": "Mumbai XL FC (XBOM)",       "city": "Bhiwandi",   "state": "MAHARASHTRA",    "cluster": "Mumbai West"},
-    # Bangalore
-    "BLR5": {"name": "Bangalore South FC (BLR5)", "city": "Bangalore",  "state": "KARNATAKA",      "cluster": "Bangalore"},
-    "BLR6": {"name": "Bangalore FC (BLR6)",       "city": "Bangalore",  "state": "KARNATAKA",      "cluster": "Bangalore"},
-    "SCJA": {"name": "Bangalore FC (SCJA)",       "city": "Bangalore",  "state": "KARNATAKA",      "cluster": "Bangalore"},
-    "XSAB": {"name": "Bangalore XS FC (XSAB)",   "city": "Bangalore",  "state": "KARNATAKA",      "cluster": "Bangalore"},
-    "SBLA": {"name": "Bangalore SBLA FC (SBLA)",  "city": "Bangalore",  "state": "KARNATAKA",      "cluster": "Bangalore"},
-    # Chennai
-    "MAA4": {"name": "Chennai FC (MAA4)",         "city": "Chennai",    "state": "TAMIL NADU",     "cluster": "Chennai"},
-    "MAA5": {"name": "Chennai FC (MAA5)",         "city": "Chennai",    "state": "TAMIL NADU",     "cluster": "Chennai"},
-    "SMAB": {"name": "Chennai SMAB FC (SMAB)",    "city": "Chennai",    "state": "TAMIL NADU",     "cluster": "Chennai"},
-    # Hyderabad
-    "HYD7": {"name": "Hyderabad FC (HYD7)",       "city": "Hyderabad",  "state": "TELANGANA",      "cluster": "Hyderabad"},
-    "HYD8": {"name": "Hyderabad FC (HYD8)",       "city": "Hyderabad",  "state": "TELANGANA",      "cluster": "Hyderabad"},
-    "HYD9": {"name": "Hyderabad FC (HYD9)",       "city": "Hyderabad",  "state": "TELANGANA",      "cluster": "Hyderabad"},
-    # Kolkata / East
-    "CCU1": {"name": "Kolkata FC (CCU1)",         "city": "Kolkata",    "state": "WEST BENGAL",    "cluster": "Kolkata East"},
-    "CCU2": {"name": "Kolkata FC (CCU2)",         "city": "Kolkata",    "state": "WEST BENGAL",    "cluster": "Kolkata East"},
-    "PAT1": {"name": "Patna FC (PAT1)",           "city": "Patna",      "state": "BIHAR",          "cluster": "Kolkata East"},
-    # Gujarat
-    "AMD1": {"name": "Ahmedabad FC (AMD1)",       "city": "Ahmedabad",  "state": "GUJARAT",        "cluster": "Gujarat West"},
-    "AMD2": {"name": "Ahmedabad FC (AMD2)",       "city": "Ahmedabad",  "state": "GUJARAT",        "cluster": "Gujarat West"},
-    "SUB1": {"name": "Surat FC (SUB1)",           "city": "Surat",      "state": "GUJARAT",        "cluster": "Gujarat West"},
+    # ASSAM
+    "SGAA":      ("Guwahati FC (SGAA)",                     "Guwahati",        "Omshree Ind Park",           "ASSAM",          "East — Assam"),
+    # DELHI
+    "DEX3":      ("New Delhi FC A28 (DEX3)",                "New Delhi",       "Mohan Co-op, Mathura Rd",    "DELHI",          "Delhi NCR"),
+    "DEX8":      ("New Delhi FC A29 (DEX8)",                "New Delhi",       "Mohan Co-op, Mathura Rd",    "DELHI",          "Delhi NCR"),
+    "PNQ2":      ("New Delhi FC A33 (PNQ2)",                "New Delhi",       "Mohan Co-op Industrial",     "DELHI",          "Delhi NCR"),
+    "XDEL":      ("Delhi XL FC (XDEL)",                     "New Delhi",       "Delhi",                      "DELHI",          "Delhi NCR"),
+    # HARYANA
+    "DEL2":      ("Tauru FC (DEL2)",                        "Mewat",           "Village Tauru",              "HARYANA",        "Delhi NCR"),
+    "DEL4":      ("Gurgaon FC (DEL4)",                      "Gurgaon",         "Village Jamalpur",           "HARYANA",        "Delhi NCR"),
+    "DEL5":      ("Manesar FC (DEL5)",                      "Manesar",         "Binola, NH-8",               "HARYANA",        "Delhi NCR"),
+    "DEL6":      ("Bilaspur FC (DEL6)",                     "Bilaspur",        "Bilaspur",                   "HARYANA",        "Delhi NCR"),
+    "DEL7":      ("Bilaspur FC 2 (DEL7)",                   "Bilaspur",        "Bilaspur",                   "HARYANA",        "Delhi NCR"),
+    "DEL8":      ("Sohna FC (DEL8)",                        "Sohna",           "ESR Sohna Logistics Park",   "HARYANA",        "Delhi NCR"),
+    "DEL8_DED5": ("Sohna ESR FC (DEL8/DED5)",              "Sohna",           "ESR Sohna-Ballabgarh Rd",    "HARYANA",        "Delhi NCR"),
+    "DED3":      ("Farrukhnagar FC (DED3)",                 "Farrukhnagar",    "Gurgaon-122506",             "HARYANA",        "Delhi NCR"),
+    "DED4":      ("Sohna FC 2 (DED4)",                      "Sohna",           "ESR Sohna Logistics Park",   "HARYANA",        "Delhi NCR"),
+    "DED5":      ("Sohna FC 3 (DED5)",                      "Sohna",           "ESR Sohna Logistics Park",   "HARYANA",        "Delhi NCR"),
+    # GUJARAT
+    "AMD1":      ("Ahmedabad Naroda FC (AMD1)",             "Naroda",          "Naroda, Ahmedabad",          "GUJARAT",        "Gujarat West"),
+    "AMD2":      ("Changodar FC (AMD2)",                    "Changodar",       "Gallops Ind Park",           "GUJARAT",        "Gujarat West"),
+    "SUB1":      ("Surat FC (SUB1)",                        "Surat",           "Surat",                      "GUJARAT",        "Gujarat West"),
+    # KARNATAKA
+    "BLR4":      ("Devanahalli FC (BLR4)",                  "Devanahalli",     "Hitech Aerospace Park",      "KARNATAKA",      "Bangalore"),
+    "BLR5":      ("Bommasandra FC (BLR5)",                  "Bommasandra",     "Hosakote, Bengaluru",        "KARNATAKA",      "Bangalore"),
+    "BLR6":      ("Nelamangala FC (BLR6)",                  "Nelamangala",     "Bengaluru",                  "KARNATAKA",      "Bangalore"),
+    "BLR7":      ("Hoskote FC (BLR7)",                      "Hoskote",         "Anekal Taluk, Bengaluru",    "KARNATAKA",      "Bangalore"),
+    "BLR8":      ("Devanahalli FC 2 (BLR8)",                "Devanahalli",     "Hitech Aerospace Park",      "KARNATAKA",      "Bangalore"),
+    "BLR10":     ("Kudlu Gate FC (BLR10)",                  "Kudlu Gate",      "Bengaluru",                  "KARNATAKA",      "Bangalore"),
+    "BLR12":     ("Attibele FC (BLR12)",                    "Attibele",        "Bengaluru",                  "KARNATAKA",      "Bangalore"),
+    "BLR13":     ("Jigani FC (BLR13)",                      "Jigani",          "Bengaluru",                  "KARNATAKA",      "Bangalore"),
+    "BLR14":     ("Anekal FC (BLR14)",                      "Anekal",          "Bengaluru",                  "KARNATAKA",      "Bangalore"),
+    "SCJA":      ("Bangalore SCJA FC (SCJA)",               "Bangalore",       "Bengaluru",                  "KARNATAKA",      "Bangalore"),
+    "XSAB":      ("Bangalore XS FC (XSAB)",                 "Bangalore",       "Bengaluru",                  "KARNATAKA",      "Bangalore"),
+    "SBLA":      ("Bangalore SBLA FC (SBLA)",               "Bangalore",       "Bengaluru",                  "KARNATAKA",      "Bangalore"),
+    # MADHYA PRADESH
+    "SIDA":      ("Indore FC (SIDA)",                       "Indore",          "Village Pipliya Kumhar",     "MADHYA PRADESH", "Central"),
+    "FBHB":      ("Bhopal FC (FBHB)",                       "Bhopal",          "Govindpura Ind Area",        "MADHYA PRADESH", "Central"),
+    "FIDA":      ("Bhopal FC 2 (FIDA)",                     "Bhopal",          "Govindpura Ind Area",        "MADHYA PRADESH", "Central"),
+    "IND1":      ("Indore FC 2 (IND1)",                     "Indore",          "Indore",                     "MADHYA PRADESH", "Central"),
+    # MAHARASHTRA
+    "BOM1":      ("Bhiwandi FC (BOM1)",                     "Bhiwandi",        "Bhiwandi, Thane",            "MAHARASHTRA",    "Mumbai West"),
+    "BOM3":      ("Nashik FC (BOM3)",                       "Nashik",          "Nashik",                     "MAHARASHTRA",    "Mumbai West"),
+    "BOM4":      ("Vashere FC (BOM4)",                      "Bhiwandi",        "Village Vashere",            "MAHARASHTRA",    "Mumbai West"),
+    "BOM5":      ("Bhiwandi 2 FC (BOM5)",                   "Bhiwandi",        "Village Vashere",            "MAHARASHTRA",    "Mumbai West"),
+    "BOM7":      ("Bhiwandi 3 FC (BOM7)",                   "Bhiwandi",        "Village Vahuli",             "MAHARASHTRA",    "Mumbai West"),
+    "ISK3":      ("Bhiwandi ISK3 FC (ISK3)",                "Bhiwandi",        "Village Pise",               "MAHARASHTRA",    "Mumbai West"),
+    "PNQ1":      ("Pune Hinjewadi FC (PNQ1)",               "Pune",            "Hinjewadi",                  "MAHARASHTRA",    "Mumbai West"),
+    "PNQ3":      ("Pune Chakan FC (PNQ3)",                  "Pune",            "Village Ambethan, Khed",     "MAHARASHTRA",    "Mumbai West"),
+    "SAMB":      ("Mumbai SAMB FC (SAMB)",                  "Mumbai",          "Mumbai",                     "MAHARASHTRA",    "Mumbai West"),
+    "XBOM":      ("Mumbai XL FC (XBOM)",                    "Bhiwandi",        "Bhiwandi",                   "MAHARASHTRA",    "Mumbai West"),
+    # PUNJAB
+    "ATX1":      ("Ludhiana FC (ATX1)",                     "Ludhiana",        "Near Katana Sahib Gurdwara", "PUNJAB",         "North Punjab"),
+    "LDH1":      ("Ludhiana FC 2 (LDH1)",                   "Ludhiana",        "Ludhiana",                   "PUNJAB",         "North Punjab"),
+    "RAJ1":      ("Rajpura FC (RAJ1)",                      "Rajpura",         "Rajpura",                    "PUNJAB",         "North Punjab"),
+    # RAJASTHAN
+    "JAI1":      ("Jaipur FC (JAI1)",                       "Jaipur",          "Bagru",                      "RAJASTHAN",      "North Rajasthan"),
+    "JPX1":      ("Jaipur JPX1 FC (JPX1)",                  "Jaipur",          "Jhotwara Ind Area",          "RAJASTHAN",      "North Rajasthan"),
+    "JPX2":      ("Bagru FC (JPX2)",                        "Bagru",           "Bagru, Sanganer",            "RAJASTHAN",      "North Rajasthan"),
+    # TAMIL NADU
+    "MAA1":      ("Irungattukottai FC (MAA1)",              "Irungattukottai", "Sriperumbudur Tk",           "TAMIL NADU",     "Chennai"),
+    "MAA2":      ("Ponneri FC (MAA2)",                      "Ponneri",         "Thiruvallur Dist",           "TAMIL NADU",     "Chennai"),
+    "MAA3":      ("Sriperumbudur FC (MAA3)",                "Sriperumbudur",   "Chennai",                    "TAMIL NADU",     "Chennai"),
+    "MAA4":      ("Ambattur FC (MAA4)",                     "Ambattur",        "Thiruvallur Dist",           "TAMIL NADU",     "Chennai"),
+    "MAA5":      ("Kanchipuram FC (MAA5)",                  "Kanchipuram",     "Kanchipuram Dist",           "TAMIL NADU",     "Chennai"),
+    "CJB1":      ("Coimbatore FC (CJB1)",                   "Coimbatore",      "Palladam Main Rd",           "TAMIL NADU",     "Chennai"),
+    "SMAB":      ("Chennai SMAB FC (SMAB)",                 "Chennai",         "Chennai",                    "TAMIL NADU",     "Chennai"),
+    # KERALA
+    "COK1":      ("Kochi FC (COK1)",                        "Kochi",           "Kochi",                      "KERALA",         "South Kerala"),
+    # TELANGANA
+    "HYD3":      ("Shamshabad FC (HYD3)",                   "Shamshabad",      "Mamidipally Village",        "TELANGANA",      "Hyderabad"),
+    "HYD6":      ("Kothur FC (HYD6)",                       "Kothur",          "Mahbubnagar Dist",           "TELANGANA",      "Hyderabad"),
+    "HYD7":      ("Medchal FC (HYD7)",                      "Medchal",         "Hyderabad",                  "TELANGANA",      "Hyderabad"),
+    "HYD8":      ("Shamshabad FC 2 (HYD8)",                 "Shamshabad",      "Hyderabad",                  "TELANGANA",      "Hyderabad"),
+    "HYD8_HYD3": ("Shamshabad Mamidipally FC (HYD8/HYD3)", "Shamshabad",      "Mamidipally Village",        "TELANGANA",      "Hyderabad"),
+    "HYD9":      ("Pedda Amberpet FC (HYD9)",               "Pedda Amberpet",  "Hyderabad",                  "TELANGANA",      "Hyderabad"),
+    "HYD10":     ("Ghatkesar FC (HYD10)",                   "Ghatkesar",       "Hyderabad",                  "TELANGANA",      "Hyderabad"),
+    "HYD11":     ("Kompally FC (HYD11)",                    "Kompally",        "Hyderabad",                  "TELANGANA",      "Hyderabad"),
+    # UTTAR PRADESH
+    "LKO1":      ("Lucknow FC (LKO1)",                      "Lucknow",         "Village Bhukapur",           "UTTAR PRADESH",  "North UP"),
+    "AGR1":      ("Agra FC (AGR1)",                         "Agra",            "Agra",                       "UTTAR PRADESH",  "North UP"),
+    "SLDK":      ("Kishanpur FC (SLDK)",                    "Bijnour",         "Kishanpur Kodia",            "UTTAR PRADESH",  "North UP"),
+    # WEST BENGAL
+    "CCU1":      ("Kolkata FC (CCU1)",                      "Kolkata",         "Rajarhat",                   "WEST BENGAL",    "Kolkata East"),
+    "CCU2":      ("Kolkata FC 2 (CCU2)",                    "Kolkata",         "Kolkata",                    "WEST BENGAL",    "Kolkata East"),
+    "CCX1":      ("Howrah FC (CCX1)",                       "Howrah",          "Panchla, Raghudevpur",       "WEST BENGAL",    "Kolkata East"),
+    "CCX2":      ("Howrah FC 2 (CCX2)",                     "Howrah",          "Panchla",                    "WEST BENGAL",    "Kolkata East"),
+    # BIHAR
+    "PAT1":      ("Patna FC (PAT1)",                        "Patna",           "Patna",                      "BIHAR",          "Kolkata East"),
+    # ODISHA
+    "BBS1":      ("Bhubaneswar FC (BBS1)",                  "Bhubaneswar",     "Bhubaneswar",                "ODISHA",         "Kolkata East"),
 }
+# Tuple index: 0=Full Name  1=City  2=Area  3=State  4=Cluster
 
 
-def _fc(code: str, key: str, fallback: str) -> str:
-    return FC_DATA.get(str(code).upper().strip(), {}).get(key, fallback)
+def _fc(code, idx, fallback):
+    e = FC_DATA.get(str(code).upper().strip())
+    return e[idx] if e else fallback
+
+def fc_name(c):    return _fc(c, 0, f"{c} (Unknown FC)")
+def fc_city(c):    return _fc(c, 1, "Unknown")
+def fc_area(c):    return _fc(c, 2, "Unknown")
+def fc_state(c):   return _fc(c, 3, "Unknown")
+def fc_cluster(c): return _fc(c, 4, "Other")
 
 
-def fc_name(code):    return _fc(code, "name",    f"FC {code}")
-def fc_cluster(code): return _fc(code, "cluster", "Other")
-def fc_state(code):   return _fc(code, "state",   "Unknown")
-def fc_city(code):    return _fc(code, "city",    "Unknown")
-
-
-# ──────────────────────────────────────────────────────────────
-# UTILITY HELPERS
-# ──────────────────────────────────────────────────────────────
-def read_file(uploaded) -> pd.DataFrame:
-    """Read CSV / ZIP(CSV) / XLSX into a DataFrame."""
+# ─────────────────────────────────────────────────────────────────
+# UTILITIES
+# ─────────────────────────────────────────────────────────────────
+def read_file(up):
     try:
-        name = uploaded.name.lower()
-        if name.endswith(".zip"):
-            with zipfile.ZipFile(uploaded) as zf:
-                for member in zf.namelist():
-                    if member.lower().endswith(".csv"):
-                        return pd.read_csv(zf.open(member), low_memory=False)
+        n = up.name.lower()
+        if n.endswith(".zip"):
+            with zipfile.ZipFile(up) as z:
+                for m in z.namelist():
+                    if m.lower().endswith(".csv"):
+                        return pd.read_csv(z.open(m), low_memory=False)
             return pd.DataFrame()
-        if name.endswith((".xlsx", ".xls")):
-            return pd.read_excel(uploaded)
-        return pd.read_csv(uploaded, low_memory=False)
-    except Exception as exc:
-        st.error(f"Cannot read **{uploaded.name}**: {exc}")
+        if n.endswith((".xlsx", ".xls")):
+            return pd.read_excel(up)
+        return pd.read_csv(up, low_memory=False)
+    except Exception as e:
+        st.error(f"Cannot read **{up.name}**: {e}")
         return pd.DataFrame()
 
 
-def find_col(df: pd.DataFrame, exact: list, fuzzy: list = None) -> str:
-    """Return the first matching column name (exact, then fuzzy)."""
-    lower_map = {c.strip().lower(): c for c in df.columns}
+def find_col(df, exact, fuzzy=None):
+    low = {c.strip().lower(): c for c in df.columns}
     for e in exact:
-        if e.strip().lower() in lower_map:
-            return lower_map[e.strip().lower()]
+        if e.strip().lower() in low:
+            return low[e.strip().lower()]
     if fuzzy:
         for col in df.columns:
-            col_lower = col.lower()
-            if any(sub in col_lower for sub in fuzzy):
+            if any(s in col.lower() for s in fuzzy):
                 return col
     return ""
 
 
-def add_sno(df: pd.DataFrame) -> pd.DataFrame:
+def sno(df):
     df = df.copy()
     df.drop(columns=["S.No"], errors="ignore", inplace=True)
-    df.insert(0, "S.No", range(1, len(df) + 1))
+    df.insert(0, "S.No", range(1, len(df)+1))
     return df
 
 
-def fmt(n) -> str:
-    try:
-        return f"{int(n):,}"
-    except Exception:
-        return str(n)
+def fmt(n):
+    try: return f"{int(n):,}"
+    except: return str(n)
 
 
-def health_tag(doc: float, pd_: int) -> str:
-    if doc <= 0:        return "⚫ No Stock"
-    if doc < 14:        return "🔴 Critical"
-    if doc < 30:        return "🟠 Low"
-    if doc < pd_:       return "🟢 Healthy"
-    if doc < pd_ * 2:   return "🟡 Excess"
+def trunc(s, n=60):
+    s = str(s)
+    return s[:n]+"…" if len(s)>n else s
+
+
+def health_tag(doc, pd_):
+    if doc <= 0:       return "⚫ No Stock"
+    if doc < 14:       return "🔴 Critical"
+    if doc < 30:       return "🟠 Low"
+    if doc < pd_:      return "🟢 Healthy"
+    if doc < pd_*2:    return "🟡 Excess"
     return "🔵 Overstocked"
 
 
-def velocity_tag(avg: float) -> str:
+def vel_tag(avg):
     if avg <= 0:   return "⚫ Dead"
     if avg < 0.5:  return "🔵 Slow"
     if avg < 2:    return "🟡 Medium"
@@ -187,967 +212,702 @@ def velocity_tag(avg: float) -> str:
     return "🔥 Top Seller"
 
 
-def trunc(s, n=60) -> str:
-    s = str(s)
-    return s[:n] + "…" if len(s) > n else s
-
-
-# ──────────────────────────────────────────────────────────────
-# SIDEBAR  — planning controls & shipment settings
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
+# SIDEBAR
+# ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Planning Controls")
-
-    planning_days = st.number_input(
-        "Planning Days (Coverage Target)", min_value=7, max_value=180, value=60, step=1
-    )
-    service_level = st.selectbox("Service Level", ["90%", "95%", "98%"])
-    Z_MAP = {"90%": 1.28, "95%": 1.65, "98%": 2.05}
-    z_val = Z_MAP[service_level]
-
-    sales_basis = st.selectbox(
-        "Sales Basis for Planning",
-        ["Total Sales (full history)", "Last 30 Days", "Last 60 Days", "Last 90 Days"],
-    )
-
+    planning_days = st.number_input("Planning Days (Coverage Target)", 7, 180, 60, 1)
+    svc_lvl       = st.selectbox("Service Level", ["90%","95%","98%"])
+    z_val         = {"90%":1.28,"95%":1.65,"98%":2.05}[svc_lvl]
+    sales_basis   = st.selectbox("Sales Basis for Planning",
+                        ["Total Sales (full history)","Last 30 Days",
+                         "Last 60 Days","Last 90 Days"])
     st.divider()
     st.subheader("🚚 Shipment Settings")
-    ship_from_name = st.text_input("Ship-From Warehouse Name", placeholder="My Warehouse")
-    ship_from_addr = st.text_area(
-        "Ship-From Address", placeholder="123 Street, City, State - 400001"
-    )
-    default_case_qty = st.number_input("Default Units Per Carton", 1, 500, 12)
-    case_packed  = st.checkbox("Case-Packed Shipment", value=False)
-    prep_owner   = st.selectbox("Prep Ownership",  ["AMAZON", "SELLER"])
-    label_owner  = st.selectbox("Label Ownership", ["AMAZON", "SELLER"])
-
+    ship_name   = st.text_input("Ship-From Warehouse Name", placeholder="My Warehouse")
+    ship_addr   = st.text_area("Ship-From Address",
+                               placeholder="123 Street, City, State - 400001")
+    case_qty    = st.number_input("Default Units Per Carton", 1, 500, 12)
+    case_packed = st.checkbox("Case-Packed Shipment", value=False)
+    prep_own    = st.selectbox("Prep Ownership",  ["AMAZON","SELLER"])
+    lbl_own     = st.selectbox("Label Ownership", ["AMAZON","SELLER"])
     st.divider()
     st.subheader("🎯 Display Filters")
-    min_dispatch  = st.number_input("Min Dispatch Units to Show", 0, 99999, 1)
-    focus_cluster = st.multiselect(
-        "Focus Clusters", sorted({v["cluster"] for v in FC_DATA.values()})
-    )
+    min_disp    = st.number_input("Min Dispatch Units to Show", 0, 99999, 1)
+    all_clusters = sorted({v[4] for v in FC_DATA.values()})
+    foc_cluster = st.multiselect("Focus Clusters", all_clusters)
 
-# ──────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
 # FILE UPLOADS
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────
 st.markdown("### 📁 Upload Files")
-up1, up2 = st.columns(2)
-with up1:
+u1, u2 = st.columns(2)
+with u1:
     mtr_files = st.file_uploader(
         "📊 MTR / Sales Report — multiple files OK (CSV, ZIP, XLSX)",
-        type=["csv", "zip", "xlsx"],
-        accept_multiple_files=True,
-    )
-with up2:
+        type=["csv","zip","xlsx"], accept_multiple_files=True)
+with u2:
     inv_file = st.file_uploader(
         "🏭 Amazon Inventory Ledger (CSV, ZIP, XLSX)",
-        type=["csv", "zip", "xlsx"],
-    )
+        type=["csv","zip","xlsx"])
 
 with st.expander("📋 Expected File Formats"):
-    st.markdown(
-        """
-**Inventory Ledger** — Seller Central → Reports → Fulfillment → Inventory Ledger:
+    st.markdown("""
+**Inventory Ledger** *(Seller Central → Reports → Fulfillment → Inventory Ledger)*
 
 | Column | Example |
 |--------|---------|
 | `Date` | 02/12/2026 |
 | `FNSKU` | X00275KJZP |
 | `MSKU` | BR-899 |
-| `Title` | GLOOYA Bracelet... |
-| `Disposition` | SELLABLE / CUSTOMER_DAMAGED |
-| `Ending Warehouse Balance` | 1 |
+| `Title` | GLOOYA Bracelet |
+| `Disposition` | SELLABLE / CUSTOMER_DAMAGED / CARRIER_DAMAGED |
+| `Ending Warehouse Balance` | 18 |
 | `Location` | LKO1 |
 
-**MTR / Sales Report** — Seller Central → Reports → Tax → MTR:
+**MTR Sales Report** *(Seller Central → Reports → Tax → MTR)*
 
 | Column | Example |
 |--------|---------|
-| `Sku` / `MSKU` | BR-899 |
+| `Sku` | BR-899 |
 | `Quantity` | 5 |
 | `Shipment Date` | 2026-01-15 |
 | `Ship To State` | UTTAR PRADESH |
 | `Fulfilment` | AFN / MFN |
-"""
-    )
+""")
 
-# ──────────────────────────────────────────────────────────────
-# EARLY EXIT — show FC reference if files not yet uploaded
-# ──────────────────────────────────────────────────────────────
 if not (mtr_files and inv_file):
     st.info("👆 Upload both files above to start the planner.")
-    with st.expander("🗺️ Supported Amazon India FC Locations"):
-        st.dataframe(
-            pd.DataFrame(
-                [{"FC Code": k, "FC Name": v["name"], "City": v["city"],
-                  "State": v["state"], "Cluster": v["cluster"]}
-                 for k, v in FC_DATA.items()]
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+    with st.expander("🗺️ All 75 Verified Amazon India FC Codes"):
+        st.dataframe(pd.DataFrame([{
+            "FC Code":k, "FC Full Name":v[0], "City":v[1],
+            "Area / Locality":v[2], "State":v[3], "Cluster":v[4]}
+            for k,v in FC_DATA.items()]),
+            use_container_width=True, hide_index=True)
     st.stop()
 
-# ══════════════════════════════════════════════════════════════
-# ①  LOAD & PARSE  INVENTORY LEDGER
-# ══════════════════════════════════════════════════════════════
+
+# ═════════════════════════════════════════════════════════════════
+# ① LOAD & PARSE INVENTORY LEDGER
+# ═════════════════════════════════════════════════════════════════
 inv_raw = read_file(inv_file)
 if inv_raw.empty:
-    st.error("Inventory file could not be read. Please check the file.")
-    st.stop()
-
+    st.error("Inventory file could not be read — check format."); st.stop()
 inv_raw.columns = inv_raw.columns.str.strip()
 
-# Detect columns
-C_INV_SKU   = find_col(inv_raw, ["MSKU", "Sku", "SKU", "ASIN"],                          ["msku", "sku", "asin"])
-C_INV_TITLE = find_col(inv_raw, ["Title", "Product Name", "Description"],                 ["title", "product"])
-C_INV_QTY   = find_col(inv_raw, ["Ending Warehouse Balance", "Quantity", "Qty"],          ["ending", "balance"])
-C_INV_LOC   = find_col(inv_raw, ["Location", "Warehouse Code", "FC Code", "FC"],          ["location", "warehouse code", "fc code"])
-C_INV_DISP  = find_col(inv_raw, ["Disposition"],                                          ["disposition"])
-C_INV_FNSKU = find_col(inv_raw, ["FNSKU"],                                                ["fnsku"])
-C_INV_DATE  = find_col(inv_raw, ["Date"],                                                 ["date"])
+C_SKU   = find_col(inv_raw, ["MSKU","Sku","SKU","ASIN"],                       ["msku","sku","asin"])
+C_TITLE = find_col(inv_raw, ["Title","Product Name","Description"],             ["title","product"])
+C_QTY   = find_col(inv_raw, ["Ending Warehouse Balance","Quantity","Qty"],      ["ending","balance"])
+C_LOC   = find_col(inv_raw, ["Location","Warehouse Code","FC Code","FC"],       ["location","warehouse code","fc code"])
+C_DISP  = find_col(inv_raw, ["Disposition"],                                    ["disposition"])
+C_FNSKU = find_col(inv_raw, ["FNSKU"],                                          ["fnsku"])
+C_DATE  = find_col(inv_raw, ["Date"],                                           ["date"])
 
-# Validate required columns
-inv_missing = [(n, c) for n, c in [("SKU/MSKU", C_INV_SKU),
-                                    ("Ending Warehouse Balance", C_INV_QTY),
-                                    ("Location/FC", C_INV_LOC)] if not c]
-if inv_missing:
-    st.error("Inventory file is missing required columns: " +
-             ", ".join(n for n, _ in inv_missing))
-    with st.expander("Detected columns in your inventory file"):
-        st.write(list(inv_raw.columns))
-    st.stop()
+for label, col in [("SKU/MSKU",C_SKU),("Ending Balance",C_QTY),("Location/FC",C_LOC)]:
+    if not col:
+        st.error(f"Inventory file missing required column: **{label}**")
+        st.write("Columns found:", list(inv_raw.columns)); st.stop()
 
-# Build working inventory frame
 inv = inv_raw.copy()
-inv["MSKU"]        = inv[C_INV_SKU].astype(str).str.strip()
-inv["Stock"]       = pd.to_numeric(inv[C_INV_QTY], errors="coerce").fillna(0)
-inv["FC Code"]     = inv[C_INV_LOC].astype(str).str.upper().str.strip()
-inv["Title"]       = inv[C_INV_TITLE].astype(str).str.strip() if C_INV_TITLE else ""
-inv["FNSKU"]       = inv[C_INV_FNSKU].astype(str).str.strip() if C_INV_FNSKU else ""
-inv["Disposition"] = (inv[C_INV_DISP].astype(str).str.upper().str.strip()
-                      if C_INV_DISP else "SELLABLE")
+inv["MSKU"]        = inv[C_SKU].astype(str).str.strip()
+inv["Stock"]       = pd.to_numeric(inv[C_QTY], errors="coerce").fillna(0)
+inv["FC Code"]     = inv[C_LOC].astype(str).str.upper().str.strip()
+inv["Title"]       = inv[C_TITLE].astype(str).str.strip() if C_TITLE else ""
+inv["FNSKU"]       = inv[C_FNSKU].astype(str).str.strip() if C_FNSKU else ""
+inv["Disposition"] = inv[C_DISP].astype(str).str.upper().str.strip() if C_DISP else "SELLABLE"
 
-# ── CRITICAL FIX ──────────────────────────────────────────────
-# Amazon Inventory Ledger has ONE ROW PER DAY per SKU/Disposition/FC.
-# Summing all rows multiplies stock by the number of days in the report.
-# Correct approach: keep only the LATEST date's row per group.
-# ──────────────────────────────────────────────────────────────
-if C_INV_DATE:
-    inv["_dt"] = pd.to_datetime(inv[C_INV_DATE], dayfirst=True, errors="coerce")
-    latest_inv_date = inv["_dt"].max()
-    inv = (
-        inv.sort_values("_dt")
-           .groupby(["MSKU", "Disposition", "FC Code"], as_index=False)
-           .last()
-           .drop(columns=["_dt"])
-    )
-    inv_date_label = latest_inv_date.strftime("%d %b %Y") if pd.notna(latest_inv_date) else "unknown"
+# ── CRITICAL FIX ──────────────────────────────────────────────────
+# Amazon Inventory Ledger = ONE ROW PER DAY per SKU/FC/Disposition.
+# Summing all rows multiplies stock by number of days in the report.
+# Fix: sort by date → keep ONLY the LATEST row per group.
+# ─────────────────────────────────────────────────────────────────
+if C_DATE:
+    inv["_dt"]   = pd.to_datetime(inv[C_DATE], dayfirst=True, errors="coerce")
+    latest_dt    = inv["_dt"].max()
+    inv          = (inv.sort_values("_dt")
+                       .groupby(["MSKU","Disposition","FC Code"], as_index=False)
+                       .last().drop(columns=["_dt"]))
+    inv_date_lbl = latest_dt.strftime("%d %b %Y") if pd.notna(latest_dt) else "latest row"
 else:
-    # No date column — just deduplicate by keeping last row
-    inv = inv.groupby(["MSKU", "Disposition", "FC Code"], as_index=False).last()
-    inv_date_label = "latest row"
+    inv          = inv.groupby(["MSKU","Disposition","FC Code"], as_index=False).last()
+    inv_date_lbl = "latest row"
 
-# Enrich with FC master data
+# Enrich with FC master
 inv["FC Name"]    = inv["FC Code"].apply(fc_name)
-inv["FC Cluster"] = inv["FC Code"].apply(fc_cluster)
+inv["FC City"]    = inv["FC Code"].apply(fc_city)
+inv["FC Area"]    = inv["FC Code"].apply(fc_area)
 inv["FC State"]   = inv["FC Code"].apply(fc_state)
+inv["FC Cluster"] = inv["FC Code"].apply(fc_cluster)
 
-# Lookup dictionaries
-fnsku_map = (
-    inv[inv["FNSKU"].notna() & ~inv["FNSKU"].isin(["nan", ""])]
-    .drop_duplicates("MSKU")
-    .set_index("MSKU")["FNSKU"]
-    .to_dict()
-)
+# Lookup maps
+fnsku_map = (inv[inv["FNSKU"].notna() & ~inv["FNSKU"].isin(["nan",""])]
+             .drop_duplicates("MSKU").set_index("MSKU")["FNSKU"].to_dict())
 title_map = inv.drop_duplicates("MSKU").set_index("MSKU")["Title"].to_dict()
 
-# Split sellable vs damaged/non-sellable
-inv_sellable = inv[inv["Disposition"] == "SELLABLE"].copy()
-inv_damaged  = inv[inv["Disposition"] != "SELLABLE"].copy()
+# Split sellable / damaged
+inv_sell = inv[inv["Disposition"]=="SELLABLE"].copy()
+inv_dmg  = inv[inv["Disposition"]!="SELLABLE"].copy()
 
 # Stock aggregates
-fc_stock = (
-    inv_sellable
-    .groupby(["MSKU", "FC Code", "FC Name", "FC Cluster", "FC State"])["Stock"]
-    .sum()
-    .reset_index()
-    .rename(columns={"Stock": "FC Stock"})
-)
+fc_stock = (inv_sell
+    .groupby(["MSKU","FC Code","FC Name","FC City","FC Area","FC Cluster","FC State"])["Stock"]
+    .sum().reset_index().rename(columns={"Stock":"FC Stock"}))
 
-sku_sellable_stock = (
-    inv_sellable.groupby("MSKU")["Stock"].sum()
-    .reset_index().rename(columns={"Stock": "Sellable Stock"})
-)
+sku_sell_stock = (inv_sell.groupby("MSKU")["Stock"].sum()
+    .reset_index().rename(columns={"Stock":"Sellable Stock"}))
 
-sku_damaged_stock = (
-    inv_damaged.groupby("MSKU")["Stock"].sum()
-    .reset_index().rename(columns={"Stock": "Damaged Stock"})
-)
+sku_dmg_stock = (inv_dmg.groupby("MSKU")["Stock"].sum()
+    .reset_index().rename(columns={"Stock":"Damaged Stock"}))
 
-disp_breakdown = (
-    inv.groupby(["MSKU", "Disposition"])["Stock"]
-    .sum().unstack(fill_value=0).reset_index()
-)
+disp_bkdn = (inv.groupby(["MSKU","Disposition"])["Stock"]
+    .sum().unstack(fill_value=0).reset_index())
 
-damaged_report = (
-    inv_damaged.groupby(["MSKU", "Disposition"])["Stock"]
-    .sum().reset_index().rename(columns={"Stock": "Qty"})
-)
-damaged_report["Title"] = damaged_report["MSKU"].map(title_map).fillna("")
+dmg_report = (inv_dmg.groupby(["MSKU","Disposition"])["Stock"]
+    .sum().reset_index().rename(columns={"Stock":"Qty"}))
+dmg_report["Title"] = dmg_report["MSKU"].map(title_map).fillna("")
 
-# ══════════════════════════════════════════════════════════════
-# ②  LOAD & PARSE  SALES / MTR
-# ══════════════════════════════════════════════════════════════
-raw_list = []
-for f in mtr_files:
-    df = read_file(f)
-    if not df.empty:
-        raw_list.append(df)
 
-if not raw_list:
-    st.error("Could not read any MTR / sales file.")
-    st.stop()
+# ═════════════════════════════════════════════════════════════════
+# ② LOAD & PARSE SALES / MTR
+# ═════════════════════════════════════════════════════════════════
+raw_sales = [read_file(f) for f in mtr_files]
+raw_sales = [d for d in raw_sales if not d.empty]
+if not raw_sales:
+    st.error("Could not read any MTR / sales file."); st.stop()
 
-sales_raw = pd.concat(raw_list, ignore_index=True)
+sr = pd.concat(raw_sales, ignore_index=True)
 
-C_SKU   = find_col(sales_raw, ["Sku", "SKU", "MSKU", "Item SKU"],              ["sku", "msku"])
-C_QTY   = find_col(sales_raw, ["Quantity", "Qty", "Units"],                    ["qty", "unit", "quant"])
-C_DATE  = find_col(sales_raw, ["Shipment Date", "Purchase Date", "Order Date", "Date"], ["date"])
-C_STATE = find_col(sales_raw, ["Ship To State", "Shipping State"],              ["ship to", "state"])
-C_FT    = find_col(sales_raw,
-                   ["Fulfilment", "Fulfillment", "Fulfilment Channel", "Fulfillment Channel"],
-                   ["fulfil", "channel"])
+CS_SKU  = find_col(sr, ["Sku","SKU","MSKU","Item SKU"],                 ["sku","msku"])
+CS_QTY  = find_col(sr, ["Quantity","Qty","Units"],                      ["qty","unit","quant"])
+CS_DATE = find_col(sr, ["Shipment Date","Purchase Date","Order Date","Date"], ["date"])
+CS_ST   = find_col(sr, ["Ship To State","Shipping State"],               ["ship to","state"])
+CS_FT   = find_col(sr, ["Fulfilment","Fulfillment",
+                          "Fulfilment Channel","Fulfillment Channel"],   ["fulfil","channel"])
 
-sales_missing = [(n, c) for n, c in [("SKU", C_SKU), ("Quantity", C_QTY), ("Date", C_DATE)]
-                 if not c]
-if sales_missing:
-    st.error("Sales file is missing required columns: " +
-             ", ".join(n for n, _ in sales_missing))
-    with st.expander("Detected columns in your sales file"):
-        st.write(list(sales_raw.columns))
-    st.stop()
+for label, col in [("SKU",CS_SKU),("Quantity",CS_QTY),("Date",CS_DATE)]:
+    if not col:
+        st.error(f"Sales file missing: **{label}**")
+        st.write("Columns found:", list(sr.columns)); st.stop()
 
-sales = sales_raw.copy()
-sales = sales.rename(columns={C_SKU: "MSKU", C_QTY: "Qty", C_DATE: "Date"})
+sales = sr.rename(columns={CS_SKU:"MSKU",CS_QTY:"Qty",CS_DATE:"Date"}).copy()
 sales["MSKU"] = sales["MSKU"].astype(str).str.strip()
 sales["Qty"]  = pd.to_numeric(sales["Qty"], errors="coerce").fillna(0)
 sales["Date"] = pd.to_datetime(sales["Date"], dayfirst=True, errors="coerce")
 sales = sales.dropna(subset=["Date"])
-sales = sales[sales["Qty"] > 0].copy()
+sales = sales[sales["Qty"]>0].copy()
+sales["Ship To State"] = (sales[CS_ST].astype(str).str.upper().str.strip()
+                          if CS_ST else "UNKNOWN")
+FT_MAP = {"AFN":"FBA","FBA":"FBA","AMAZON_FULFILLED":"FBA",
+          "MFN":"FBM","FBM":"FBM","MERCHANT_FULFILLED":"FBM"}
+sales["Channel"] = (sales[CS_FT].astype(str).str.upper().str.strip().map(FT_MAP).fillna("FBA")
+                    if CS_FT else "FBA")
 
-sales["Ship To State"] = (
-    sales[C_STATE].astype(str).str.upper().str.strip() if C_STATE else "UNKNOWN"
-)
+s_min   = sales["Date"].min();  s_max = sales["Date"].max()
+up_days = max((s_max-s_min).days+1, 1)
+window  = (30 if "30" in sales_basis else 60 if "60" in sales_basis
+           else 90 if "90" in sales_basis else up_days)
+cutoff  = s_max - pd.Timedelta(days=window-1)
+hist    = sales[sales["Date"]>=cutoff].copy() if window<up_days else sales.copy()
+h_days  = max((hist["Date"].max()-hist["Date"].min()).days+1, 1)
 
-FT_MAP = {
-    "AFN": "FBA", "FBA": "FBA", "AMAZON_FULFILLED": "FBA",
-    "MFN": "FBM", "FBM": "FBM", "MERCHANT_FULFILLED": "FBM",
-}
-if C_FT:
-    sales["Channel"] = (
-        sales[C_FT].astype(str).str.upper().str.strip().map(FT_MAP).fillna("FBA")
-    )
-else:
-    sales["Channel"] = "FBA"
-
-# ── Sales window ────────────────────────────────────────────
-s_min = sales["Date"].min()
-s_max = sales["Date"].max()
-uploaded_days = max((s_max - s_min).days + 1, 1)
-
-if   "30" in sales_basis: window = 30
-elif "60" in sales_basis: window = 60
-elif "90" in sales_basis: window = 90
-else:                     window = uploaded_days
-
-cutoff    = s_max - pd.Timedelta(days=window - 1)
-hist      = sales[sales["Date"] >= cutoff].copy() if window < uploaded_days else sales.copy()
-hist_days = max((hist["Date"].max() - hist["Date"].min()).days + 1, 1)
-
-# ── Demand aggregates ────────────────────────────────────────
-ch_hist  = (hist.groupby(["MSKU", "Channel"])["Qty"].sum()
-            .reset_index().rename(columns={"Qty": "Hist Sales"}))
-ch_full  = (sales.groupby(["MSKU", "Channel"])["Qty"].sum()
-            .reset_index().rename(columns={"Qty": "All-Time Sales"}))
-ch_daily = hist.groupby(["MSKU", "Channel", "Date"])["Qty"].sum().reset_index()
-ch_std   = (ch_daily.groupby(["MSKU", "Channel"])["Qty"].std()
-            .reset_index().rename(columns={"Qty": "Demand StdDev"}))
-
-sku_top_states = (
-    hist.groupby(["MSKU", "Ship To State"])["Qty"].sum()
-    .reset_index()
-    .sort_values("Qty", ascending=False)
+ch_hist  = (hist.groupby(["MSKU","Channel"])["Qty"].sum()
+            .reset_index().rename(columns={"Qty":"Hist Sales"}))
+ch_full  = (sales.groupby(["MSKU","Channel"])["Qty"].sum()
+            .reset_index().rename(columns={"Qty":"All-Time Sales"}))
+ch_daily = hist.groupby(["MSKU","Channel","Date"])["Qty"].sum().reset_index()
+ch_std   = (ch_daily.groupby(["MSKU","Channel"])["Qty"].std()
+            .reset_index().rename(columns={"Qty":"Demand StdDev"}))
+top_states = (hist.groupby(["MSKU","Ship To State"])["Qty"].sum()
+    .reset_index().sort_values("Qty",ascending=False)
     .groupby("MSKU")["Ship To State"]
-    .apply(lambda x: ", ".join(list(x)[:3]))
-    .reset_index()
-    .rename(columns={"Ship To State": "Top States"})
-)
+    .apply(lambda x:", ".join(list(x)[:3]))
+    .reset_index().rename(columns={"Ship To State":"Top States"}))
 
-# ══════════════════════════════════════════════════════════════
-# ③  PLANNING TABLE
-# ══════════════════════════════════════════════════════════════
-plan_keys = pd.concat(
-    [ch_hist[["MSKU", "Channel"]],
-     sku_sellable_stock.assign(Channel="FBA")[["MSKU", "Channel"]]],
-    ignore_index=True,
-).drop_duplicates()
 
-plan = plan_keys.copy()
-plan = plan.merge(ch_hist,             on=["MSKU", "Channel"], how="left")
-plan = plan.merge(ch_full,             on=["MSKU", "Channel"], how="left")
-plan = plan.merge(ch_std,              on=["MSKU", "Channel"], how="left")
-plan = plan.merge(sku_sellable_stock,  on="MSKU",              how="left")
-plan = plan.merge(sku_damaged_stock,   on="MSKU",              how="left")
-plan = plan.merge(sku_top_states,      on="MSKU",              how="left")
+# ═════════════════════════════════════════════════════════════════
+# ③ PLANNING TABLE
+# ═════════════════════════════════════════════════════════════════
+keys = pd.concat([
+    ch_hist[["MSKU","Channel"]],
+    sku_sell_stock.assign(Channel="FBA")[["MSKU","Channel"]]
+], ignore_index=True).drop_duplicates()
 
-for col in ["Hist Sales", "All-Time Sales", "Sellable Stock",
-            "Damaged Stock", "Demand StdDev"]:
-    plan[col] = pd.to_numeric(plan[col], errors="coerce").fillna(0)
+plan = keys.copy()
+for df_, on_ in [(ch_hist,["MSKU","Channel"]),(ch_full,["MSKU","Channel"]),
+                 (ch_std,["MSKU","Channel"]),(sku_sell_stock,"MSKU"),
+                 (sku_dmg_stock,"MSKU"),(top_states,"MSKU")]:
+    plan = plan.merge(df_, on=on_, how="left")
 
-plan["Title"]            = plan["MSKU"].map(title_map).fillna("")
-plan["FNSKU"]            = plan["MSKU"].map(fnsku_map).fillna("")
-plan["Sales Days Used"]  = hist_days
-plan["Planning Days"]    = planning_days
-plan["Avg Daily Sale"]   = (plan["Hist Sales"] / hist_days).round(4)
-plan["Safety Stock"]     = (z_val * plan["Demand StdDev"] * math.sqrt(planning_days)).round(0)
-plan["Base Requirement"] = (plan["Avg Daily Sale"] * planning_days).round(0)
-plan["Required Stock"]   = (plan["Base Requirement"] + plan["Safety Stock"]).round(0)
-plan["Dispatch Needed"]  = (plan["Required Stock"] - plan["Sellable Stock"]).clip(lower=0).round(0)
+for c in ["Hist Sales","All-Time Sales","Sellable Stock","Damaged Stock","Demand StdDev"]:
+    plan[c] = pd.to_numeric(plan[c], errors="coerce").fillna(0)
 
-plan["Days of Cover"] = np.where(
-    plan["Avg Daily Sale"] > 0,
-    (plan["Sellable Stock"] / plan["Avg Daily Sale"]).round(1),
-    np.where(plan["Sellable Stock"] > 0, 9999, 0),
-)
+plan["Title"]           = plan["MSKU"].map(title_map).fillna("")
+plan["FNSKU"]           = plan["MSKU"].map(fnsku_map).fillna("")
+plan["Sales Days Used"] = h_days
+plan["Planning Days"]   = planning_days
+plan["Avg Daily Sale"]  = (plan["Hist Sales"]/h_days).round(4)
+plan["Safety Stock"]    = (z_val*plan["Demand StdDev"]*math.sqrt(planning_days)).round(0)
+plan["Base Req"]        = (plan["Avg Daily Sale"]*planning_days).round(0)
+plan["Required Stock"]  = (plan["Base Req"]+plan["Safety Stock"]).round(0)
+plan["Dispatch Needed"] = (plan["Required Stock"]-plan["Sellable Stock"]).clip(lower=0).round(0)
+plan["Days of Cover"]   = np.where(
+    plan["Avg Daily Sale"]>0,
+    (plan["Sellable Stock"]/plan["Avg Daily Sale"]).round(1),
+    np.where(plan["Sellable Stock"]>0, 9999, 0))
+plan["Health"]   = plan.apply(lambda r: health_tag(r["Days of Cover"],planning_days), axis=1)
+plan["Velocity"] = plan["Avg Daily Sale"].apply(vel_tag)
 
-plan["Health"]   = plan.apply(lambda r: health_tag(r["Days of Cover"], planning_days), axis=1)
-plan["Velocity"] = plan["Avg Daily Sale"].apply(velocity_tag)
+_mx = plan["Avg Daily Sale"].max() or 1
+plan["Priority"] = plan.apply(lambda r: round(
+    (max(0,(planning_days-min(r["Days of Cover"],planning_days))/planning_days)*0.65
+     +min(r["Avg Daily Sale"]/_mx,1)*0.35)*100,1)
+    if r["Avg Daily Sale"]>0 else 0, axis=1)
 
-_max_avg = plan["Avg Daily Sale"].max() or 1
-plan["Priority Score"] = plan.apply(
-    lambda r: round(
-        (max(0, (planning_days - min(r["Days of Cover"], planning_days)) / planning_days) * 0.65
-         + min(r["Avg Daily Sale"] / _max_avg, 1) * 0.35) * 100, 1
-    ) if r["Avg Daily Sale"] > 0 else 0,
-    axis=1,
-)
+fba_plan = plan[plan["Channel"]=="FBA"].copy()
+fbm_plan = plan[plan["Channel"]=="FBM"].copy()
 
-fba_plan = plan[plan["Channel"] == "FBA"].copy()
-fbm_plan = plan[plan["Channel"] == "FBM"].copy()
+PCOLS = ["MSKU","FNSKU","Title","Avg Daily Sale","Sellable Stock","Safety Stock",
+         "Required Stock","Dispatch Needed","Days of Cover","Health","Velocity",
+         "Priority","Top States"]
 
-DISP_COLS = ["MSKU", "FNSKU", "Title", "Avg Daily Sale", "Sellable Stock",
-             "Safety Stock", "Required Stock", "Dispatch Needed",
-             "Days of Cover", "Health", "Velocity", "Priority Score", "Top States"]
 
-# ══════════════════════════════════════════════════════════════
-# ④  FC-WISE PLAN
-# ══════════════════════════════════════════════════════════════
-fc_plan = fc_stock.merge(
-    plan[["MSKU", "Channel", "Avg Daily Sale", "Dispatch Needed",
-          "Sellable Stock", "Required Stock", "Hist Sales",
-          "Title", "FNSKU", "Priority Score", "Days of Cover"]],
-    on="MSKU", how="left",
-)
+# ═════════════════════════════════════════════════════════════════
+# ④ FC-WISE PLAN  — Code · Full Name · City · Area · State · Cluster
+# ═════════════════════════════════════════════════════════════════
+fcp = fc_stock.merge(
+    plan[["MSKU","Channel","Avg Daily Sale","Dispatch Needed","Sellable Stock",
+          "Required Stock","Hist Sales","Title","FNSKU","Priority","Days of Cover"]],
+    on="MSKU", how="left")
 
-fc_plan["FC Days of Cover"] = np.where(
-    fc_plan["Avg Daily Sale"] > 0,
-    (fc_plan["FC Stock"] / fc_plan["Avg Daily Sale"]).round(1),
-    np.where(fc_plan["FC Stock"] > 0, 9999, 0),
-)
-fc_plan["FC Health"]   = fc_plan.apply(
-    lambda r: health_tag(r["FC Days of Cover"], planning_days), axis=1
-)
-fc_plan["FC Priority"] = fc_plan["FC Days of Cover"].apply(
-    lambda d: "🔴 Urgent" if d < 14 else ("🟠 Soon" if d < 30 else "🟢 OK")
-)
+fcp["FC DOC"] = np.where(
+    fcp["Avg Daily Sale"]>0,
+    (fcp["FC Stock"]/fcp["Avg Daily Sale"]).round(1),
+    np.where(fcp["FC Stock"]>0, 9999, 0))
+fcp["FC Health"]   = fcp.apply(lambda r: health_tag(r["FC DOC"],planning_days), axis=1)
+fcp["FC Priority"] = fcp["FC DOC"].apply(
+    lambda d:"🔴 Urgent" if d<14 else("🟠 Soon" if d<30 else "🟢 OK"))
 
-_fc_total = (fc_plan.groupby(["MSKU", "Channel"])["FC Stock"].sum()
-             .reset_index().rename(columns={"FC Stock": "_total_fc"}))
-fc_plan = fc_plan.merge(_fc_total, on=["MSKU", "Channel"], how="left")
-fc_plan["FC Share"]    = (fc_plan["FC Stock"] / fc_plan["_total_fc"].replace(0, 1)).fillna(1.0)
-fc_plan["FC Dispatch"] = (fc_plan["Dispatch Needed"] * fc_plan["FC Share"]).round(0)
-fc_plan.drop(columns=["_total_fc"], inplace=True)
+_tot = (fcp.groupby(["MSKU","Channel"])["FC Stock"].sum()
+        .reset_index().rename(columns={"FC Stock":"_T"}))
+fcp = fcp.merge(_tot, on=["MSKU","Channel"], how="left")
+fcp["FC Share"]    = (fcp["FC Stock"]/fcp["_T"].replace(0,1)).fillna(1.0)
+fcp["FC Dispatch"] = (fcp["Dispatch Needed"]*fcp["FC Share"]).round(0)
+fcp.drop(columns=["_T"], inplace=True)
 
-# filtered view
-fc_view = fc_plan.copy()
-if focus_cluster:
-    fc_view = fc_view[fc_view["FC Cluster"].isin(focus_cluster)]
-fc_view = fc_view[fc_view["FC Dispatch"] >= min_dispatch]
+fcv = fcp.copy()
+if foc_cluster: fcv = fcv[fcv["FC Cluster"].isin(foc_cluster)]
+fcv = fcv[fcv["FC Dispatch"]>=min_disp]
 
-FC_DISP_COLS = ["FC Code", "FC Name", "FC Cluster", "MSKU", "Title",
-                "FC Stock", "Avg Daily Sale", "FC Days of Cover",
-                "FC Health", "FC Dispatch", "FC Priority"]
+FC_COLS = ["FC Code","FC Name","FC City","FC Area","FC State","FC Cluster",
+           "MSKU","Title","FC Stock","Avg Daily Sale",
+           "FC DOC","FC Health","FC Dispatch","FC Priority"]
 
-# ══════════════════════════════════════════════════════════════
-# ⑤  CLUSTER SUMMARY
-# ══════════════════════════════════════════════════════════════
-cluster_sum = (
-    fc_plan.groupby("FC Cluster")
-    .agg(
-        FC_Names       =("FC Name",          lambda x: " | ".join(sorted(set(x)))),
-        FC_Codes       =("FC Code",          lambda x: ", ".join(sorted(set(x)))),
-        Total_Stock    =("FC Stock",         "sum"),
-        Dispatch_Needed=("FC Dispatch",      "sum"),
-        Avg_DOC        =("FC Days of Cover", "mean"),
-        SKUs           =("MSKU",            "nunique"),
-    )
-    .reset_index()
-    .rename(columns={
-        "FC_Names": "FC Names", "FC_Codes": "FC Codes",
-        "Total_Stock": "Total Stock", "Dispatch_Needed": "Dispatch Needed",
-        "Avg_DOC": "Avg Days of Cover", "SKUs": "Unique SKUs",
-    })
-)
-cluster_sum["Avg Days of Cover"] = cluster_sum["Avg Days of Cover"].round(1)
-cluster_sum = cluster_sum.sort_values("Dispatch Needed", ascending=False)
-cluster_sum = add_sno(cluster_sum)
 
-# ══════════════════════════════════════════════════════════════
-# ⑥  RISK TABLES
-# ══════════════════════════════════════════════════════════════
-df_critical = plan[(plan["Days of Cover"]  < 14) & (plan["Avg Daily Sale"] > 0)].copy()
-df_dead      = plan[(plan["Avg Daily Sale"] == 0) & (plan["Sellable Stock"] > 0)].copy()
-df_slow      = plan[(plan["Avg Daily Sale"] > 0)  & (plan["Days of Cover"] > 90)].copy()
-df_excess    = plan[plan["Days of Cover"] > planning_days * 2].copy()
-df_top20     = plan[plan["Avg Daily Sale"] > 0].nlargest(20, "Avg Daily Sale").copy()
+# ═════════════════════════════════════════════════════════════════
+# ⑤ CLUSTER SUMMARY
+# ═════════════════════════════════════════════════════════════════
+cl_sum = (fcp.groupby("FC Cluster").agg(
+    FC_Names       =("FC Name",    lambda x:" | ".join(sorted(set(x)))),
+    FC_Codes       =("FC Code",    lambda x:", ".join(sorted(set(x)))),
+    FC_Cities      =("FC City",    lambda x:", ".join(sorted(set(x)))),
+    Total_Stock    =("FC Stock",   "sum"),
+    Dispatch_Needed=("FC Dispatch","sum"),
+    Avg_DOC        =("FC DOC",     "mean"),
+    SKUs           =("MSKU",       "nunique"),
+).reset_index().rename(columns={
+    "FC_Names":"FC Names","FC_Codes":"FC Codes","FC_Cities":"Cities",
+    "Total_Stock":"Total Stock","Dispatch_Needed":"Dispatch Needed",
+    "Avg_DOC":"Avg Days of Cover","SKUs":"Unique SKUs"}))
+cl_sum["Avg Days of Cover"] = cl_sum["Avg Days of Cover"].round(1)
+cl_sum = sno(cl_sum.sort_values("Dispatch Needed",ascending=False))
 
-# ══════════════════════════════════════════════════════════════
-# ⑦  STATE / TREND ANALYTICS
-# ══════════════════════════════════════════════════════════════
-state_demand = (
-    sales.groupby("Ship To State")["Qty"].sum()
-    .reset_index().rename(columns={"Qty": "Total Units"})
-    .sort_values("Total Units", ascending=False)
-)
-state_demand["% Share"] = (
-    state_demand["Total Units"] / state_demand["Total Units"].sum() * 100
-).round(1)
-state_demand = add_sno(state_demand)
 
-weekly_trend = (
-    sales.assign(Week=sales["Date"].dt.to_period("W").astype(str))
-    .groupby("Week")["Qty"].sum()
-    .reset_index().rename(columns={"Qty": "Units Sold"})
-    .sort_values("Week")
-)
-monthly_trend = (
-    sales.assign(Month=sales["Date"].dt.to_period("M").astype(str))
-    .groupby("Month")["Qty"].sum()
-    .reset_index().rename(columns={"Qty": "Units Sold"})
-    .sort_values("Month")
-)
+# ═════════════════════════════════════════════════════════════════
+# ⑥ RISK TABLES
+# ═════════════════════════════════════════════════════════════════
+r_crit   = plan[(plan["Days of Cover"]<14)  &(plan["Avg Daily Sale"]>0)].copy()
+r_dead   = plan[(plan["Avg Daily Sale"]==0) &(plan["Sellable Stock"]>0)].copy()
+r_slow   = plan[(plan["Avg Daily Sale"]>0)  &(plan["Days of Cover"]>90)].copy()
+r_excess = plan[plan["Days of Cover"]>planning_days*2].copy()
+r_top20  = plan[plan["Avg Daily Sale"]>0].nlargest(20,"Avg Daily Sale").copy()
 
-# ══════════════════════════════════════════════════════════════
-# ⑧  EXECUTIVE DASHBOARD
-# ══════════════════════════════════════════════════════════════
+
+# ═════════════════════════════════════════════════════════════════
+# ⑦ STATE / TREND
+# ═════════════════════════════════════════════════════════════════
+st_dem = (sales.groupby("Ship To State")["Qty"].sum()
+    .reset_index().rename(columns={"Qty":"Total Units"})
+    .sort_values("Total Units",ascending=False))
+st_dem["% Share"] = (st_dem["Total Units"]/st_dem["Total Units"].sum()*100).round(1)
+st_dem = sno(st_dem)
+
+wk_tr = (sales.assign(Week=sales["Date"].dt.to_period("W").astype(str))
+    .groupby("Week")["Qty"].sum().reset_index()
+    .rename(columns={"Qty":"Units Sold"}).sort_values("Week"))
+mo_tr = (sales.assign(Month=sales["Date"].dt.to_period("M").astype(str))
+    .groupby("Month")["Qty"].sum().reset_index()
+    .rename(columns={"Qty":"Units Sold"}).sort_values("Month"))
+
+
+# ═════════════════════════════════════════════════════════════════
+# ⑧ EXECUTIVE DASHBOARD
+# ═════════════════════════════════════════════════════════════════
 st.markdown("---")
 st.markdown("### 📊 Executive Dashboard")
 
-_total_skus     = plan["MSKU"].nunique()
-_total_sellable = int(sku_sellable_stock["Sellable Stock"].sum())
-_total_damaged  = int(sku_damaged_stock["Damaged Stock"].sum()) if not sku_damaged_stock.empty else 0
-_total_dispatch = int(fba_plan["Dispatch Needed"].sum())
-_avg_doc        = (plan[plan["Avg Daily Sale"] > 0]["Days of Cover"]
-                   .replace(9999, np.nan).mean())
+tot_skus = plan["MSKU"].nunique()
+tot_sell = int(sku_sell_stock["Sellable Stock"].sum())
+tot_dmg  = int(sku_dmg_stock["Damaged Stock"].sum()) if not sku_dmg_stock.empty else 0
+tot_disp = int(fba_plan["Dispatch Needed"].sum())
+avg_doc  = plan[plan["Avg Daily Sale"]>0]["Days of Cover"].replace(9999,np.nan).mean()
 
-m1, m2, m3, m4, m5, m6 = st.columns(6)
-m1.metric("Total SKUs",         fmt(_total_skus))
-m2.metric("Sellable Stock",     fmt(_total_sellable))
-m3.metric("Damaged Stock",      fmt(_total_damaged))
-m4.metric("Units to Dispatch",  fmt(_total_dispatch))
-m5.metric("🔴 Critical SKUs",   fmt(len(df_critical)))
-m6.metric("Avg Days of Cover",  f"{_avg_doc:.0f}d" if pd.notna(_avg_doc) else "N/A")
+m1,m2,m3,m4,m5,m6 = st.columns(6)
+m1.metric("Total SKUs",        fmt(tot_skus))
+m2.metric("Sellable Stock",    fmt(tot_sell))
+m3.metric("Damaged Stock",     fmt(tot_dmg))
+m4.metric("Units to Dispatch", fmt(tot_disp))
+m5.metric("🔴 Critical SKUs",  fmt(len(r_crit)))
+m6.metric("Avg Days of Cover", f"{avg_doc:.0f}d" if pd.notna(avg_doc) else "N/A")
 
-# Inventory snapshot info
 st.markdown(
-    f'<div class="alert-green">✅ Inventory snapshot: latest date used = <b>{inv_date_label}</b> '
-    f'| {len(inv)} rows after daily deduplication (was {len(inv_raw)} raw rows)</div>',
-    unsafe_allow_html=True,
-)
-if len(df_critical):
-    st.markdown(
-        f'<div class="alert-red">🚨 {len(df_critical)} SKU(s) below 14 days of stock — replenish immediately!</div>',
-        unsafe_allow_html=True,
-    )
-if len(df_dead):
-    st.markdown(
-        f'<div class="alert-yellow">⚠️ {len(df_dead)} SKU(s) have stock but ZERO sales — fix listing or liquidate.</div>',
-        unsafe_allow_html=True,
-    )
-if len(df_excess):
-    st.markdown(
-        f'<div class="alert-yellow">📦 {len(df_excess)} SKU(s) overstocked (>{planning_days*2} days) — pause replenishment.</div>',
-        unsafe_allow_html=True,
-    )
-if _total_damaged:
-    st.markdown(
-        f'<div class="alert-yellow">🔧 {fmt(_total_damaged)} damaged/non-sellable units — '
-        f'raise a removal order or reimbursement claim in Seller Central.</div>',
-        unsafe_allow_html=True,
-    )
+    f'<div class="ab ab-g">✅ Inventory snapshot: <b>{inv_date_lbl}</b> | '
+    f'{len(inv)} rows after daily dedup (raw: {len(inv_raw)} rows)</div>',
+    unsafe_allow_html=True)
+if r_crit.shape[0]:
+    st.markdown(f'<div class="ab ab-r">🚨 {len(r_crit)} SKU(s) below 14 days — replenish immediately!</div>',unsafe_allow_html=True)
+if r_dead.shape[0]:
+    st.markdown(f'<div class="ab ab-y">⚠️ {len(r_dead)} SKU(s) have stock but ZERO sales — fix listing or liquidate.</div>',unsafe_allow_html=True)
+if r_excess.shape[0]:
+    st.markdown(f'<div class="ab ab-y">📦 {len(r_excess)} SKU(s) overstocked (>{planning_days*2}d) — pause replenishment.</div>',unsafe_allow_html=True)
+if tot_dmg:
+    st.markdown(f'<div class="ab ab-y">🔧 {fmt(tot_dmg)} damaged units — raise Removal / Reimbursement in Seller Central.</div>',unsafe_allow_html=True)
 
-# ══════════════════════════════════════════════════════════════
-# ⑨  MAIN TABS
-# ══════════════════════════════════════════════════════════════
+
+# ═════════════════════════════════════════════════════════════════
+# ⑨ MAIN TABS
+# ═════════════════════════════════════════════════════════════════
 tabs = st.tabs([
-    "🏠 Overview",
-    "📦 FBA Plan",
-    "📮 FBM Plan",
-    "🏭 FC-Wise Plan",
-    "🗺️ Cluster View",
-    "🚨 Risk Alerts",
-    "📈 Trends",
-    "🌍 State Demand",
-    "🔧 Damaged Stock",
-    "📄 Amazon Flat File",
-])
+    "🏠 Overview","📦 FBA Plan","📮 FBM Plan","🏭 FC-Wise Plan",
+    "🗺️ Cluster View","🚨 Risk Alerts","📈 Trends",
+    "🌍 State Demand","🔧 Damaged Stock","📄 Amazon Flat File"])
 
-# ── 0  OVERVIEW ──────────────────────────────────────────────
+# ── OVERVIEW ─────────────────────────────────────────────────────
 with tabs[0]:
     st.subheader("🏠 Planning Overview")
-    oc1, oc2 = st.columns(2)
-    with oc1:
+    c1,c2 = st.columns(2)
+    with c1:
         fcs_found = ", ".join(sorted(inv["FC Code"].unique()))
         st.info(
-            f"**Sales data:** {s_min.strftime('%d %b %Y')} → {s_max.strftime('%d %b %Y')} "
-            f"({uploaded_days} days)\n\n"
-            f"**Sales basis:** {sales_basis} ({hist_days} days used)\n\n"
-            f"**Planning horizon:** {planning_days} days | "
-            f"**Service level:** {service_level} (Z = {z_val})\n\n"
-            f"**Total SKUs:** {_total_skus} | **FCs:** {fcs_found}"
-        )
-    with oc2:
+            f"**Sales data:** {s_min.strftime('%d %b %Y')} → {s_max.strftime('%d %b %Y')} ({up_days} days)\n\n"
+            f"**Sales basis:** {sales_basis} ({h_days} days used)\n\n"
+            f"**Planning horizon:** {planning_days} days | **Service level:** {svc_lvl} (Z={z_val})\n\n"
+            f"**Total SKUs:** {tot_skus} | **FCs in data:** {fcs_found}")
+    with c2:
         st.markdown("**🔝 Top 5 Most Urgent SKUs**")
-        top5 = plan[plan["Dispatch Needed"] > 0].nlargest(5, "Priority Score")[
-            ["MSKU", "Title", "Avg Daily Sale", "Days of Cover",
-             "Dispatch Needed", "Priority Score"]
-        ].copy()
-        top5["Title"] = top5["Title"].apply(lambda x: trunc(x, 45))
+        top5 = (plan[plan["Dispatch Needed"]>0].nlargest(5,"Priority")
+                [["MSKU","Title","Avg Daily Sale","Days of Cover",
+                  "Dispatch Needed","Priority"]].copy())
+        top5["Title"] = top5["Title"].apply(lambda x:trunc(x,45))
         st.dataframe(top5, use_container_width=True, hide_index=True)
 
     st.markdown("**📊 Monthly Sales Trend**")
-    if not monthly_trend.empty:
-        st.bar_chart(monthly_trend.set_index("Month")["Units Sold"])
+    if not mo_tr.empty: st.bar_chart(mo_tr.set_index("Month")["Units Sold"])
 
-    col_a, col_b = st.columns(2)
-    with col_a:
+    oa,ob = st.columns(2)
+    with oa:
         st.markdown("**🗺️ Cluster Dispatch Summary**")
-        st.dataframe(
-            cluster_sum[["FC Cluster", "FC Names", "Total Stock",
-                         "Dispatch Needed", "Avg Days of Cover", "Unique SKUs"]],
-            use_container_width=True, hide_index=True,
-        )
-    with col_b:
-        st.markdown("**🏭 Inventory by FC**")
-        fc_inv_tbl = (
-            fc_plan.groupby(["FC Code", "FC Name", "FC Cluster"])["FC Stock"]
-            .sum().reset_index()
-            .rename(columns={"FC Stock": "Total Sellable Stock"})
-            .sort_values("Total Sellable Stock", ascending=False)
-        )
-        st.dataframe(fc_inv_tbl, use_container_width=True, hide_index=True)
+        st.dataframe(cl_sum[["FC Cluster","FC Names","Cities","Total Stock",
+                              "Dispatch Needed","Avg Days of Cover","Unique SKUs"]],
+                     use_container_width=True, hide_index=True)
+    with ob:
+        st.markdown("**🏭 Stock by FC (Code + Name + City + State)**")
+        fc_inv = (fcp.groupby(["FC Code","FC Name","FC City","FC State","FC Cluster"])["FC Stock"]
+                  .sum().reset_index()
+                  .rename(columns={"FC Stock":"Total Sellable Stock"})
+                  .sort_values("Total Sellable Stock",ascending=False))
+        st.dataframe(fc_inv, use_container_width=True, hide_index=True)
 
-# ── 1  FBA PLAN ──────────────────────────────────────────────
+# ── FBA PLAN ─────────────────────────────────────────────────────
 with tabs[1]:
     st.subheader("📦 FBA Planning")
-    st.caption(
-        f"{len(fba_plan)} SKUs | {planning_days}-day plan @ {service_level} service level"
-    )
-    fba_v = (
-        fba_plan[fba_plan["Dispatch Needed"] >= min_dispatch]
-        .sort_values("Priority Score", ascending=False)
-        .copy()
-    )
-    fba_v["Title"] = fba_v["Title"].apply(lambda x: trunc(x, 60))
-    st.dataframe(
-        add_sno(fba_v[[c for c in DISP_COLS if c in fba_v.columns]]),
-        use_container_width=True,
-    )
+    st.caption(f"{len(fba_plan)} SKUs | {planning_days}-day plan @ {svc_lvl}")
+    fv = (fba_plan[fba_plan["Dispatch Needed"]>=min_disp]
+          .sort_values("Priority",ascending=False).copy())
+    fv["Title"] = fv["Title"].apply(lambda x:trunc(x,60))
+    st.dataframe(sno(fv[[c for c in PCOLS if c in fv.columns]]), use_container_width=True)
 
-# ── 2  FBM PLAN ──────────────────────────────────────────────
+# ── FBM PLAN ─────────────────────────────────────────────────────
 with tabs[2]:
     st.subheader("📮 FBM Planning")
     if fbm_plan.empty:
         st.info("No FBM SKUs found — all inventory appears to be FBA.")
     else:
-        fbm_v = (
-            fbm_plan[fbm_plan["Dispatch Needed"] >= min_dispatch]
-            .sort_values("Priority Score", ascending=False)
-            .copy()
-        )
-        fbm_v["Title"] = fbm_v["Title"].apply(lambda x: trunc(x, 60))
-        st.dataframe(add_sno(fbm_v), use_container_width=True)
+        fv2 = (fbm_plan[fbm_plan["Dispatch Needed"]>=min_disp]
+               .sort_values("Priority",ascending=False).copy())
+        fv2["Title"] = fv2["Title"].apply(lambda x:trunc(x,60))
+        st.dataframe(sno(fv2[[c for c in PCOLS if c in fv2.columns]]), use_container_width=True)
 
-# ── 3  FC-WISE PLAN ──────────────────────────────────────────
+# ── FC-WISE PLAN ──────────────────────────────────────────────────
 with tabs[3]:
-    st.subheader("🏭 FC / Warehouse Wise Dispatch Plan")
-    st.caption(
-        "Units to dispatch per FC — allocated proportionally by current stock share at each location."
-    )
-    fv = (
-        fc_view.sort_values(["FC Cluster", "FC Dispatch"], ascending=[True, False])
-        .copy()
-    )
-    fv["Title"] = fv["Title"].apply(lambda x: trunc(x, 50))
-    st.dataframe(
-        add_sno(fv[[c for c in FC_DISP_COLS if c in fv.columns]]),
-        use_container_width=True,
-    )
+    st.subheader("🏭 FC / Warehouse-Wise Dispatch Plan")
+    st.caption("Every row: FC Code · Full FC Name · City · Area · State · Cluster. "
+               "Units allocated proportionally by current stock share at each location.")
+    fv3 = fcv.sort_values(["FC Cluster","FC Dispatch"],ascending=[True,False]).copy()
+    fv3["Title"] = fv3["Title"].apply(lambda x:trunc(x,50))
+    st.dataframe(sno(fv3[[c for c in FC_COLS if c in fv3.columns]]), use_container_width=True)
 
-# ── 4  CLUSTER VIEW ──────────────────────────────────────────
+# ── CLUSTER VIEW ──────────────────────────────────────────────────
 with tabs[4]:
     st.subheader("🗺️ Cluster-Level Inventory View")
-    st.dataframe(cluster_sum, use_container_width=True, hide_index=True)
+    st.dataframe(cl_sum, use_container_width=True, hide_index=True)
     st.divider()
-    for _, row in cluster_sum.iterrows():
+    for _,row in cl_sum.iterrows():
         cl = row["FC Cluster"]
         with st.expander(
-            f"📍 {cl}  —  {fmt(int(row['Dispatch Needed']))} units needed  |  {row['FC Names']}"
-        ):
-            cd = fc_plan[fc_plan["FC Cluster"] == cl].copy()
-            cd["Title"] = cd["Title"].apply(lambda x: trunc(x, 55))
+            f"📍 {cl}  —  {fmt(int(row['Dispatch Needed']))} units needed  "
+            f"|  FC Codes: {row['FC Codes']}"):
+            cd = fcp[fcp["FC Cluster"]==cl].copy()
+            cd["Title"] = cd["Title"].apply(lambda x:trunc(x,55))
             st.dataframe(
-                cd[["FC Code", "FC Name", "MSKU", "Title", "FC Stock",
-                    "Avg Daily Sale", "FC Days of Cover", "FC Dispatch", "FC Priority"]],
-                use_container_width=True, hide_index=True,
-            )
+                cd[["FC Code","FC Name","FC City","FC Area","FC State",
+                    "MSKU","Title","FC Stock","Avg Daily Sale",
+                    "FC DOC","FC Dispatch","FC Priority"]],
+                use_container_width=True, hide_index=True)
 
-# ── 5  RISK ALERTS ───────────────────────────────────────────
+# ── RISK ALERTS ───────────────────────────────────────────────────
 with tabs[5]:
-    rt1, rt2, rt3, rt4 = st.tabs(
-        ["🔴 Critical (<14d)", "⚫ Dead Stock", "🟡 Slow Moving (>90d)", "🔵 Excess"]
-    )
-
-    RISK_COLS = ["MSKU", "Title", "Channel", "Avg Daily Sale", "Sellable Stock",
-                 "Days of Cover", "Dispatch Needed", "Health", "Top States"]
-
-    def risk_table(df):
-        d = df.copy()
-        d["Title"] = d["Title"].apply(lambda x: trunc(x, 55))
-        return add_sno(d[[c for c in RISK_COLS if c in d.columns]])
+    rt1,rt2,rt3,rt4 = st.tabs(
+        ["🔴 Critical (<14d)","⚫ Dead Stock","🟡 Slow Moving (>90d)","🔵 Excess"])
+    RCOLS = ["MSKU","Title","Channel","Avg Daily Sale","Sellable Stock",
+             "Days of Cover","Dispatch Needed","Health","Top States"]
+    def rtbl(df):
+        d=df.copy(); d["Title"]=d["Title"].apply(lambda x:trunc(x,55))
+        return sno(d[[c for c in RCOLS if c in d.columns]])
 
     with rt1:
-        st.markdown(f"**{len(df_critical)} SKU(s) — order immediately**")
-        if not df_critical.empty:
-            st.dataframe(
-                risk_table(df_critical.sort_values("Days of Cover")),
-                use_container_width=True,
-            )
-        else:
-            st.success("No critical SKUs — all stock levels are healthy.")
+        st.markdown(f"**{len(r_crit)} SKU(s) — order immediately**")
+        if not r_crit.empty:
+            st.dataframe(rtbl(r_crit.sort_values("Days of Cover")), use_container_width=True)
+        else: st.success("All clear — no critical SKUs!")
 
     with rt2:
-        st.markdown(f"**{len(df_dead)} SKU(s) — stock exists but zero sales**")
-        if not df_dead.empty:
-            d2 = df_dead.copy()
-            d2["Title"] = d2["Title"].apply(lambda x: trunc(x, 55))
-            st.dataframe(
-                add_sno(d2[["MSKU", "Title", "Channel", "Sellable Stock", "All-Time Sales"]]),
-                use_container_width=True,
-            )
-        else:
-            st.success("No dead stock found.")
+        st.markdown(f"**{len(r_dead)} SKU(s) — stock exists but zero sales**")
+        if not r_dead.empty:
+            d2=r_dead.copy(); d2["Title"]=d2["Title"].apply(lambda x:trunc(x,55))
+            st.dataframe(sno(d2[["MSKU","Title","Channel","Sellable Stock","All-Time Sales"]]),
+                         use_container_width=True)
+        else: st.success("No dead stock found.")
 
     with rt3:
-        st.markdown(f"**{len(df_slow)} SKU(s) — days of cover > 90**")
-        if not df_slow.empty:
-            st.dataframe(
-                risk_table(df_slow.sort_values("Days of Cover", ascending=False)),
-                use_container_width=True,
-            )
-        else:
-            st.success("No slow-moving SKUs found.")
+        st.markdown(f"**{len(r_slow)} SKU(s) — days of cover > 90**")
+        if not r_slow.empty:
+            st.dataframe(rtbl(r_slow.sort_values("Days of Cover",ascending=False)), use_container_width=True)
+        else: st.success("No slow-moving SKUs.")
 
     with rt4:
-        st.markdown(f"**{len(df_excess)} SKU(s) — cover > {planning_days * 2} days**")
-        if not df_excess.empty:
-            st.dataframe(
-                risk_table(df_excess.sort_values("Days of Cover", ascending=False)),
-                use_container_width=True,
-            )
-        else:
-            st.success("No excess stock found.")
+        st.markdown(f"**{len(r_excess)} SKU(s) — cover > {planning_days*2} days**")
+        if not r_excess.empty:
+            st.dataframe(rtbl(r_excess.sort_values("Days of Cover",ascending=False)), use_container_width=True)
+        else: st.success("No excess stock.")
 
-# ── 6  TRENDS ────────────────────────────────────────────────
+# ── TRENDS ────────────────────────────────────────────────────────
 with tabs[6]:
     st.subheader("📈 Sales Trends")
-    tr1, tr2 = st.columns(2)
-    with tr1:
+    tc1,tc2 = st.columns(2)
+    with tc1:
         st.markdown("**Weekly Sales**")
-        if not weekly_trend.empty:
-            st.line_chart(weekly_trend.set_index("Week")["Units Sold"])
-    with tr2:
+        if not wk_tr.empty: st.line_chart(wk_tr.set_index("Week")["Units Sold"])
+    with tc2:
         st.markdown("**Monthly Sales**")
-        if not monthly_trend.empty:
-            st.bar_chart(monthly_trend.set_index("Month")["Units Sold"])
+        if not mo_tr.empty: st.bar_chart(mo_tr.set_index("Month")["Units Sold"])
 
     st.markdown("**🔥 Top 20 SKUs by Avg Daily Sale**")
-    t20 = df_top20.copy()
-    t20["Title"] = t20["Title"].apply(lambda x: trunc(x, 60))
-    st.dataframe(
-        add_sno(t20[["MSKU", "Title", "Avg Daily Sale", "Days of Cover",
-                     "Sellable Stock", "Velocity", "Top States"]]),
-        use_container_width=True,
-    )
-
+    t20=r_top20.copy(); t20["Title"]=t20["Title"].apply(lambda x:trunc(x,60))
+    st.dataframe(sno(t20[["MSKU","Title","Avg Daily Sale","Days of Cover",
+                           "Sellable Stock","Velocity","Top States"]]), use_container_width=True)
     st.divider()
     st.markdown("**🔍 SKU Drill-Down — Daily Sales Chart**")
-    sku_options = sorted(sales["MSKU"].unique())
-    sel_sku = st.selectbox("Select MSKU", sku_options)
-    sku_daily = (
-        sales[sales["MSKU"] == sel_sku]
-        .groupby("Date")["Qty"].sum()
-        .reset_index()
-        .set_index("Date")
-    )
-    if not sku_daily.empty:
-        st.caption(f"**{trunc(title_map.get(sel_sku, sel_sku), 90)}**")
-        st.line_chart(sku_daily["Qty"])
+    sel = st.selectbox("Select MSKU", sorted(sales["MSKU"].unique()))
+    sku_d = (sales[sales["MSKU"]==sel].groupby("Date")["Qty"]
+             .sum().reset_index().set_index("Date"))
+    if not sku_d.empty:
+        st.caption(f"**{trunc(title_map.get(sel,sel),90)}**")
+        st.line_chart(sku_d["Qty"])
 
-# ── 7  STATE DEMAND ──────────────────────────────────────────
+# ── STATE DEMAND ──────────────────────────────────────────────────
 with tabs[7]:
     st.subheader("🌍 State-Level Demand Analysis")
-    sd1, sd2 = st.columns([2, 1])
+    sd1,sd2 = st.columns([2,1])
     with sd1:
-        st.dataframe(state_demand, use_container_width=True, hide_index=True)
+        st.dataframe(st_dem, use_container_width=True, hide_index=True)
     with sd2:
         st.markdown("**State × SKU Matrix (Top 10 SKUs)**")
-        top10_skus = plan.nlargest(10, "Avg Daily Sale")["MSKU"].tolist()
-        sm = (
-            hist[hist["MSKU"].isin(top10_skus)]
-            .groupby(["Ship To State", "MSKU"])["Qty"].sum()
-            .unstack(fill_value=0)
-        )
-        if not sm.empty:
-            st.dataframe(sm, use_container_width=True)
+        top10 = plan.nlargest(10,"Avg Daily Sale")["MSKU"].tolist()
+        sm = (hist[hist["MSKU"].isin(top10)]
+              .groupby(["Ship To State","MSKU"])["Qty"].sum().unstack(fill_value=0))
+        if not sm.empty: st.dataframe(sm, use_container_width=True)
 
-# ── 8  DAMAGED STOCK ─────────────────────────────────────────
+# ── DAMAGED STOCK ─────────────────────────────────────────────────
 with tabs[8]:
     st.subheader("🔧 Damaged / Non-Sellable Stock")
-    st.caption(
-        "Raise a **Removal Order** or **Reimbursement Claim** in Seller Central for these units."
-    )
-    if damaged_report.empty:
+    st.caption("Raise a Removal Order or Reimbursement Claim in Seller Central.")
+    if dmg_report.empty:
         st.success("No damaged or non-sellable stock found.")
     else:
-        dr = damaged_report.copy()
-        dr["Title"] = dr["Title"].apply(lambda x: trunc(x, 65))
-        st.dataframe(
-            add_sno(dr.sort_values("Qty", ascending=False)),
-            use_container_width=True,
-        )
+        dr=dmg_report.copy(); dr["Title"]=dr["Title"].apply(lambda x:trunc(x,65))
+        st.dataframe(sno(dr.sort_values("Qty",ascending=False)), use_container_width=True)
         st.divider()
         st.markdown("**Full Disposition Breakdown per MSKU**")
-        db = disp_breakdown.copy()
-        db.insert(1, "Title", db["MSKU"].map(title_map).fillna("").apply(lambda x: trunc(x, 60)))
-        st.dataframe(add_sno(db), use_container_width=True)
+        db=disp_bkdn.copy()
+        db.insert(1,"Title",db["MSKU"].map(title_map).fillna("").apply(lambda x:trunc(x,60)))
+        st.dataframe(sno(db), use_container_width=True)
 
-# ── 9  AMAZON FLAT FILE ──────────────────────────────────────
+# ── AMAZON FLAT FILE ──────────────────────────────────────────────
 with tabs[9]:
     st.subheader("📄 Amazon FBA Shipment Flat File Generator")
     st.info(
-        "**How to use:**\n"
-        "1. Review / edit the quantities in the table below\n"
-        "2. Select target FC and click **Download**\n"
-        "3. In Seller Central → **Send to Amazon → Create New Shipment → Upload a file**\n"
-        "4. Upload the `.txt` file — Amazon creates shipments automatically ✅\n\n"
-        "_Each FC requires a separate shipment. Use the per-FC buttons at the bottom._"
-    )
+        "1. Review / edit quantities below\n"
+        "2. Select target FC → Download\n"
+        "3. Seller Central → **Send to Amazon → Create New Shipment → Upload a file** ✅\n\n"
+        "_Each FC requires a separate flat file._")
 
-    ff1, ff2, ff3 = st.columns(3)
+    ff1,ff2,ff3 = st.columns(3)
     with ff1:
-        shipment_name = st.text_input(
-            "Shipment Name", value=f"Replenishment_{datetime.now().strftime('%Y%m%d')}"
-        )
-        ship_date = st.date_input(
-            "Expected Ship Date", value=datetime.now().date() + timedelta(days=2)
-        )
+        shp_label = st.text_input("Shipment Name",
+            value=f"Replenishment_{datetime.now().strftime('%Y%m%d')}")
+        shp_date = st.date_input("Expected Ship Date",
+            value=datetime.now().date()+timedelta(days=2))
     with ff2:
         all_fcs = sorted(inv["FC Code"].unique())
-        target_fc = st.selectbox(
-            "Target FC", all_fcs, format_func=lambda x: f"{x} — {fc_name(x)}"
-        )
+        tgt_fc  = st.selectbox("Target FC", all_fcs,
+            format_func=lambda x:f"{x} — {fc_name(x)}")
     with ff3:
-        st.markdown(f"**FC:** {fc_name(target_fc)}")
-        st.markdown(f"**Cluster:** {fc_cluster(target_fc)}")
-        st.markdown(f"**State:** {fc_state(target_fc)}")
+        st.markdown(f"**FC Name:** {fc_name(tgt_fc)}")
+        st.markdown(f"**City:** {fc_city(tgt_fc)}  |  **Area:** {fc_area(tgt_fc)}")
+        st.markdown(f"**State:** {fc_state(tgt_fc)}")
+        st.markdown(f"**Cluster:** {fc_cluster(tgt_fc)}")
 
-    # Build editable dispatch table (FBA only, with units needed)
-    flat_base = fba_plan[fba_plan["Dispatch Needed"] > 0].copy()
+    flat_base = fba_plan[fba_plan["Dispatch Needed"]>0].copy()
     flat_base["Units to Ship"]  = flat_base["Dispatch Needed"].astype(int)
-    flat_base["Units Per Case"] = default_case_qty
-    flat_base["No. of Cases"]   = np.ceil(
-        flat_base["Units to Ship"] / default_case_qty
-    ).astype(int)
-    flat_base["Title Short"] = flat_base["Title"].apply(lambda x: trunc(x, 80))
+    flat_base["Units Per Case"] = case_qty
+    flat_base["No. of Cases"]   = np.ceil(flat_base["Units to Ship"]/case_qty).astype(int)
+    flat_base["Title Short"]    = flat_base["Title"].apply(lambda x:trunc(x,80))
 
-    st.markdown(
-        f"**{len(flat_base)} SKUs | Total: {fmt(flat_base['Units to Ship'].sum())} units to dispatch**"
-    )
-
-    edit_cols = ["MSKU", "FNSKU", "Title Short", "Units to Ship",
-                 "Units Per Case", "No. of Cases"]
+    st.markdown(f"**{len(flat_base)} SKUs | {fmt(flat_base['Units to Ship'].sum())} total units**")
+    ecols  = ["MSKU","FNSKU","Title Short","Units to Ship","Units Per Case","No. of Cases"]
     edited = st.data_editor(
-        flat_base[[c for c in edit_cols if c in flat_base.columns]].reset_index(drop=True),
-        num_rows="dynamic",
-        use_container_width=True,
-    )
+        flat_base[[c for c in ecols if c in flat_base.columns]].reset_index(drop=True),
+        num_rows="dynamic", use_container_width=True)
 
-    def build_flat_file(df: pd.DataFrame, fc_code: str) -> str:
-        """Generate Amazon FBA Shipment Creation flat file (tab-delimited)."""
-        parts   = [p.strip() for p in ship_from_addr.split(",")]
-        city    = parts[1] if len(parts) > 1 else ""
-        st_zip  = parts[2] if len(parts) > 2 else ""
-        st_code = (
-            st_zip.split("-")[0].strip()[:2].upper()
-            if "-" in st_zip else st_zip[:2].upper()
-        )
-        postal = st_zip.split("-")[1].strip() if "-" in st_zip else ""
-
-        lines = ["TemplateType=FlatFileShipmentCreation\tVersion=2015.0403", ""]
-
-        # Shipment header
-        meta_h = ["ShipmentName", "ShipFromName", "ShipFromAddressLine1",
-                  "ShipFromCity", "ShipFromStateOrProvinceCode", "ShipFromPostalCode",
-                  "ShipFromCountryCode", "ShipmentStatus", "LabelPrepType",
-                  "AreCasesRequired", "DestinationFulfillmentCenterId"]
-        meta_v = [shipment_name, ship_from_name or "My Warehouse",
-                  parts[0] if parts else "", city, st_code, postal, "IN",
-                  "WORKING", label_owner,
-                  "YES" if case_packed else "NO",
-                  fc_code]
-        lines += ["\t".join(meta_h), "\t".join(str(v) for v in meta_v), ""]
-
-        # Item rows
-        item_h = ["SellerSKU", "FNSKU", "QuantityShipped", "QuantityInCase",
-                  "PrepOwner", "LabelOwner", "ItemDescription", "ExpectedDeliveryDate"]
-        lines.append("\t".join(item_h))
-
-        for _, row in df.iterrows():
-            qty_in_case = (str(int(row.get("Units Per Case", default_case_qty)))
-                           if case_packed else "")
-            lines.append(
-                "\t".join([
-                    str(row["MSKU"]),
-                    str(row.get("FNSKU", "")),
-                    str(int(row["Units to Ship"])),
-                    qty_in_case,
-                    prep_owner,
-                    label_owner,
-                    str(row.get("Title Short", ""))[:200],
-                    str(ship_date),
-                ])
-            )
+    def make_flat_file(df, fc_code):
+        parts = [p.strip() for p in ship_addr.split(",")]
+        city  = parts[1] if len(parts)>1 else ""
+        stz   = parts[2] if len(parts)>2 else ""
+        stc   = stz.split("-")[0].strip()[:2].upper() if "-" in stz else stz[:2].upper()
+        post  = stz.split("-")[1].strip() if "-" in stz else ""
+        lines = ["TemplateType=FlatFileShipmentCreation\tVersion=2015.0403",""]
+        mh = ["ShipmentName","ShipFromName","ShipFromAddressLine1","ShipFromCity",
+              "ShipFromStateOrProvinceCode","ShipFromPostalCode","ShipFromCountryCode",
+              "ShipmentStatus","LabelPrepType","AreCasesRequired",
+              "DestinationFulfillmentCenterId"]
+        mv = [shp_label, ship_name or "My Warehouse",
+              parts[0] if parts else "", city, stc, post,
+              "IN","WORKING",lbl_own,"YES" if case_packed else "NO", fc_code]
+        lines += ["\t".join(mh), "\t".join(str(v) for v in mv),""]
+        lines.append("\t".join(["SellerSKU","FNSKU","QuantityShipped","QuantityInCase",
+                                  "PrepOwner","LabelOwner","ItemDescription","ExpectedDeliveryDate"]))
+        for _,r in df.iterrows():
+            qic = str(int(r.get("Units Per Case",case_qty))) if case_packed else ""
+            lines.append("\t".join([
+                str(r["MSKU"]), str(r.get("FNSKU","")),
+                str(int(r["Units to Ship"])), qic, prep_own, lbl_own,
+                str(r.get("Title Short",""))[:200], str(shp_date)]))
         return "\n".join(lines)
 
-    # Preview + download for selected FC
-    flat_content = build_flat_file(edited, target_fc)
+    flat_txt = make_flat_file(edited, tgt_fc)
     with st.expander("👁️ Preview Flat File"):
-        st.code(
-            flat_content[:2500] + ("\n...(truncated)" if len(flat_content) > 2500 else "")
-        )
+        st.code(flat_txt[:2500]+("\n...(truncated)" if len(flat_txt)>2500 else ""))
 
     st.download_button(
-        f"📥 Download Flat File → {target_fc} ({fc_name(target_fc)})",
-        data=flat_content.encode("utf-8"),
-        file_name=f"Amazon_FBA_{target_fc}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt",
-        mime="text/plain",
-    )
+        f"📥 Download Flat File → {tgt_fc} ({fc_name(tgt_fc)})",
+        flat_txt.encode("utf-8"),
+        f"Amazon_FBA_{tgt_fc}_{datetime.now().strftime('%Y%m%d_%H%M')}.txt","text/plain")
 
-    # Per-FC download buttons
-    if len(all_fcs) > 1:
+    if len(all_fcs)>1:
         st.divider()
-        st.markdown("**📦 Download Separate Flat File per FC**")
-        btn_cols = st.columns(min(len(all_fcs), 4))
-        for i, fc_code in enumerate(all_fcs):
-            fc_flat = build_flat_file(edited, fc_code)
-            with btn_cols[i % 4]:
+        st.markdown("**📦 Download Separate Flat File Per FC**")
+        bc = st.columns(min(len(all_fcs),4))
+        for i,fc in enumerate(all_fcs):
+            with bc[i%4]:
                 st.download_button(
-                    f"📥 {fc_code}\n{fc_name(fc_code)}",
-                    data=fc_flat.encode("utf-8"),
-                    file_name=f"Amazon_FBA_{fc_code}_{datetime.now().strftime('%Y%m%d')}.txt",
-                    mime="text/plain",
-                    key=f"fc_dl_{fc_code}",
-                )
+                    f"📥 {fc}\n{fc_name(fc)}",
+                    make_flat_file(edited,fc).encode("utf-8"),
+                    f"Amazon_FBA_{fc}_{datetime.now().strftime('%Y%m%d')}.txt",
+                    "text/plain", key=f"dl_{fc}")
 
-# ══════════════════════════════════════════════════════════════
-# ⑩  EXCEL EXPORT
-# ══════════════════════════════════════════════════════════════
+
+# ═════════════════════════════════════════════════════════════════
+# ⑩ EXCEL EXPORT  — 16 sheets
+# ═════════════════════════════════════════════════════════════════
 st.markdown("---")
 
-
-def build_excel() -> io.BytesIO:
+def build_excel():
     out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
-        wb  = writer.book
-        hdr = wb.add_format({
-            "bold": True, "bg_color": "#1a365d", "font_color": "white",
-            "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True,
-        })
-
-        def write_sheet(df: pd.DataFrame, sheet_name: str):
+    with pd.ExcelWriter(out, engine="xlsxwriter") as w:
+        wb  = w.book
+        hdr = wb.add_format({"bold":True,"bg_color":"#1a365d","font_color":"white",
+                              "border":1,"align":"center","valign":"vcenter","text_wrap":True})
+        def ws(df, name):
             if df.empty:
-                pd.DataFrame({"Note": ["No data for this sheet"]}).to_excel(
-                    writer, sheet_name=sheet_name, index=False
-                )
-                return
-            d = df.copy()
-            if "Title" in d.columns:
-                d["Title"] = d["Title"].astype(str).str[:80]
-            d.to_excel(writer, sheet_name=sheet_name, index=False, startrow=1)
-            ws = writer.sheets[sheet_name]
-            for ci, cn in enumerate(d.columns):
-                ws.write(0, ci, cn, hdr)
-                col_w = max(
-                    len(str(cn)),
-                    d[cn].astype(str).str.len().max() if not d.empty else 10,
-                )
-                ws.set_column(ci, ci, min(col_w + 2, 45))
-            ws.freeze_panes(2, 0)
-            ws.autofilter(0, 0, len(d), len(d.columns) - 1)
+                pd.DataFrame({"Note":["No data"]}).to_excel(w,sheet_name=name,index=False); return
+            d=df.copy()
+            if "Title" in d.columns: d["Title"]=d["Title"].astype(str).str[:80]
+            d.to_excel(w,sheet_name=name,index=False,startrow=1)
+            sh=w.sheets[name]
+            for ci,cn in enumerate(d.columns):
+                sh.write(0,ci,cn,hdr)
+                cw=max(len(str(cn)),d[cn].astype(str).str.len().max() if not d.empty else 10)
+                sh.set_column(ci,ci,min(cw+2,45))
+            sh.freeze_panes(2,0)
+            sh.autofilter(0,0,len(d),len(d.columns)-1)
 
-        write_sheet(add_sno(fba_plan.sort_values("Priority Score", ascending=False)), "FBA Plan")
-        write_sheet(add_sno(fbm_plan),                                                "FBM Plan")
-        write_sheet(
-            add_sno(fc_plan.sort_values(["FC Cluster", "FC Dispatch"],
-                                         ascending=[True, False])),                   "FC Dispatch Plan",
-        )
-        write_sheet(cluster_sum,                                                       "Cluster Summary")
-        write_sheet(add_sno(plan.sort_values("Priority Score", ascending=False)),     "All SKUs")
-        write_sheet(add_sno(df_critical.sort_values("Days of Cover")),                "CRITICAL Stock")
-        write_sheet(add_sno(df_dead),                                                 "Dead Stock")
-        write_sheet(add_sno(df_slow.sort_values("Days of Cover", ascending=False)),   "Slow Moving")
-        write_sheet(add_sno(df_excess.sort_values("Days of Cover", ascending=False)), "Excess Stock")
-        write_sheet(add_sno(damaged_report.sort_values("Qty", ascending=False)),      "Damaged Stock")
-        write_sheet(disp_breakdown,                                                    "Disposition Breakdown")
-        write_sheet(state_demand,                                                      "State Demand")
-        write_sheet(weekly_trend,                                                      "Weekly Trend")
-        write_sheet(monthly_trend,                                                     "Monthly Trend")
-        write_sheet(add_sno(df_top20),                                                "Top 20 SKUs")
+        ws(sno(fba_plan.sort_values("Priority",ascending=False)),       "FBA Plan")
+        ws(sno(fbm_plan),                                                "FBM Plan")
+        ws(sno(fcp.sort_values(["FC Cluster","FC Dispatch"],
+                                ascending=[True,False])),                "FC Dispatch Plan")
+        ws(cl_sum,                                                        "Cluster Summary")
+        ws(sno(plan.sort_values("Priority",ascending=False)),            "All SKUs")
+        ws(sno(r_crit.sort_values("Days of Cover")),                     "CRITICAL Stock")
+        ws(sno(r_dead),                                                   "Dead Stock")
+        ws(sno(r_slow.sort_values("Days of Cover",ascending=False)),     "Slow Moving")
+        ws(sno(r_excess.sort_values("Days of Cover",ascending=False)),   "Excess Stock")
+        ws(sno(dmg_report.sort_values("Qty",ascending=False)),           "Damaged Stock")
+        ws(disp_bkdn,                                                     "Disposition Breakdown")
+        ws(st_dem,                                                        "State Demand")
+        ws(wk_tr,                                                         "Weekly Trend")
+        ws(mo_tr,                                                         "Monthly Trend")
+        ws(sno(r_top20),                                                  "Top 20 SKUs")
+        ws(pd.DataFrame([{"FC Code":k,"FC Full Name":v[0],"City":v[1],
+                           "Area / Locality":v[2],"State":v[3],"Cluster":v[4]}
+                          for k,v in FC_DATA.items()]),                   "FC Reference")
+    out.seek(0); return out
 
-    out.seek(0)
-    return out
-
-
-dl1, dl2 = st.columns(2)
+dl1,dl2 = st.columns(2)
 with dl1:
     st.download_button(
-        "📥 Download Full Intelligence Report (Excel)",
+        "📥 Download Full Intelligence Report (Excel — 16 sheets)",
         data=build_excel(),
         file_name=f"FBA_Supply_Plan_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 with dl2:
-    dispatch_csv = fba_plan[fba_plan["Dispatch Needed"] > 0][
-        ["MSKU", "FNSKU", "Title", "Avg Daily Sale", "Sellable Stock",
-         "Days of Cover", "Required Stock", "Dispatch Needed",
-         "Priority Score", "Velocity", "Top States"]
-    ].to_csv(index=False)
+    disp_csv = fba_plan[fba_plan["Dispatch Needed"]>0][
+        ["MSKU","FNSKU","Title","Avg Daily Sale","Sellable Stock",
+         "Days of Cover","Required Stock","Dispatch Needed",
+         "Priority","Velocity","Top States"]].to_csv(index=False)
     st.download_button(
         "📋 Download Dispatch Plan (CSV)",
-        data=dispatch_csv,
+        data=disp_csv,
         file_name=f"Dispatch_Plan_{datetime.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv",
-    )
+        mime="text/csv")
