@@ -355,6 +355,19 @@ fc_stock = (inv_sell
     .groupby(["MSKU","FC Code","FC Name","FC City","FC Area","FC Cluster","FC State"])["Stock"]
     .sum().reset_index().rename(columns={"Stock":"FC Stock"}))
 
+# ── FC-WISE STOCK PIVOT ───────────────────────────────────────────────────────
+# Creates one column per FC code, labelled "CODE — FC Full Name"
+# e.g. "LKO1 — Lucknow FC (LKO1)", "DEX3 — New Delhi FC A28 (DEX3)"
+_pivot_raw = (inv_sell.groupby(["MSKU","FC Code"])["Stock"]
+    .sum().reset_index())
+_pivot_raw["FC Label"] = (_pivot_raw["FC Code"] + "\n" +
+                          _pivot_raw["FC Code"].apply(fc_name))
+fc_pivot = (_pivot_raw.pivot_table(
+    index="MSKU", columns="FC Label", values="Stock", aggfunc="sum", fill_value=0)
+    .reset_index())
+fc_pivot.columns.name = None
+FC_STOCK_COLS = [c for c in fc_pivot.columns if c != "MSKU"]
+
 sku_sell_stock = (inv_sell.groupby("MSKU")["Stock"].sum()
     .reset_index().rename(columns={"Stock":"Sellable Stock"}))
 
@@ -440,6 +453,11 @@ for df_, on_ in [(ch_hist,["MSKU","Channel"]),(ch_full,["MSKU","Channel"]),
                  (sku_dmg_stock,"MSKU"),(top_states,"MSKU")]:
     plan = plan.merge(df_, on=on_, how="left")
 
+# Merge FC-wise stock pivot columns into plan
+plan = plan.merge(fc_pivot, on="MSKU", how="left")
+for fc_col in FC_STOCK_COLS:
+    plan[fc_col] = pd.to_numeric(plan[fc_col], errors="coerce").fillna(0)
+
 for c in ["Hist Sales","All-Time Sales","Sellable Stock","Damaged Stock","Demand StdDev"]:
     plan[c] = pd.to_numeric(plan[c], errors="coerce").fillna(0)
 
@@ -468,9 +486,11 @@ plan["Priority"] = plan.apply(lambda r: round(
 fba_plan = plan[plan["Channel"]=="FBA"].copy()
 fbm_plan = plan[plan["Channel"]=="FBM"].copy()
 
-PCOLS = ["MSKU","FNSKU","Title","Avg Daily Sale","Sellable Stock","Safety Stock",
-         "Required Stock","Dispatch Needed","Days of Cover","Health","Velocity",
-         "Priority","Top States"]
+# PCOLS built dynamically — FC stock columns inserted after "Sellable Stock"
+_BASE_PCOLS_BEFORE = ["MSKU","FNSKU","Title","Avg Daily Sale","Sellable Stock"]
+_BASE_PCOLS_AFTER  = ["Safety Stock","Required Stock","Dispatch Needed",
+                       "Days of Cover","Health","Velocity","Priority","Top States"]
+PCOLS = _BASE_PCOLS_BEFORE + FC_STOCK_COLS + _BASE_PCOLS_AFTER
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -902,10 +922,12 @@ with dl1:
         file_name=f"FBA_Supply_Plan_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 with dl2:
+    _csv_cols = (["MSKU","FNSKU","Title","Avg Daily Sale","Sellable Stock"]
+                 + FC_STOCK_COLS
+                 + ["Days of Cover","Required Stock","Dispatch Needed",
+                    "Priority","Velocity","Top States"])
     disp_csv = fba_plan[fba_plan["Dispatch Needed"]>0][
-        ["MSKU","FNSKU","Title","Avg Daily Sale","Sellable Stock",
-         "Days of Cover","Required Stock","Dispatch Needed",
-         "Priority","Velocity","Top States"]].to_csv(index=False)
+        [c for c in _csv_cols if c in fba_plan.columns]].to_csv(index=False)
     st.download_button(
         "📋 Download Dispatch Plan (CSV)",
         data=disp_csv,
