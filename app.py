@@ -226,15 +226,19 @@ with st.sidebar:
 # FILE UPLOAD
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("### 📂 Upload Your Files")
-c1, c2 = st.columns(2)
-with c1:
-    inv_file = st.file_uploader(
-        "**📊 Inventory Ledger** (Required) — CSV/ZIP/XLSX",
-        type=["csv","zip","xlsx"], key="inv")
-with c2:
-    mtr_file = st.file_uploader(
-        "**📋 MTR Sales Report** (Optional) — CSV/ZIP/XLSX",
-        type=["csv","zip","xlsx"], key="mtr")
+st.info("💡 **Multiple files:** Hold **Ctrl** (Windows) or **Cmd** (Mac) while clicking to select multiple files, or drag and drop several files at once.")
+
+inv_files = st.file_uploader(
+    "📊 Inventory Ledger — Required  (CSV / ZIP / XLSX)  |  You can select multiple files",
+    type=["csv","zip","xlsx"],
+    accept_multiple_files=True,
+    key="inv")
+
+mtr_files = st.file_uploader(
+    "📋 MTR Sales Report — Optional  (CSV / ZIP / XLSX)  |  You can select multiple files",
+    type=["csv","zip","xlsx"],
+    accept_multiple_files=True,
+    key="mtr")
 
 with st.expander("ℹ️ Which files to download from Seller Central?"):
     st.markdown("""
@@ -243,23 +247,29 @@ with st.expander("ℹ️ Which files to download from Seller Central?"):
 | **Inventory Ledger** | Reports → Fulfillment → Inventory Ledger | Stock + Sales (primary source) |
 | **MTR** | Reports → Tax → MTR | Extra sales data (optional) |
 
+> **Multiple files:** You can upload multiple months of Inventory Ledger or MTR at once — they will be automatically merged.
+
 **Inventory Ledger must have these columns:**
 `Date`, `MSKU`, `FNSKU`, `Title`, `Disposition`, `Ending Warehouse Balance`,
 `Customer Shipments` (negative = sold), `Customer Returns`, `Location` (FC code)
 """)
 
-if not inv_file:
-    st.info("👆 Upload the **Inventory Ledger** to get started.")
+if not inv_files:
+    st.info("👆 Upload the **Inventory Ledger** to get started. You can upload multiple files at once.")
     st.stop()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PARSE INVENTORY LEDGER
 # ─────────────────────────────────────────────────────────────────────────────
-raw = read_file(inv_file)
-if raw.empty:
-    st.error("Could not read Inventory Ledger. Check file format."); st.stop()
-raw.columns = raw.columns.str.strip()
+raw_parts = [read_file(f) for f in inv_files]
+raw_parts = [d for d in raw_parts if not d.empty]
+if not raw_parts:
+    st.error("Could not read any Inventory Ledger file. Check file format."); st.stop()
+# Merge all uploaded ledger files — strip column whitespace on each before concat
+for i in range(len(raw_parts)):
+    raw_parts[i].columns = raw_parts[i].columns.str.strip()
+raw = pd.concat(raw_parts, ignore_index=True)
 
 # Column detection — exact Amazon Inventory Ledger names first
 C_DATE  = col(raw, ["Date"])
@@ -365,10 +375,13 @@ if C_SHIP and C_DATE:
 
 # From MTR file
 mtr_sales = pd.DataFrame()
-if mtr_file:
-    mr = read_file(mtr_file)
-    if not mr.empty:
-        mr.columns = mr.columns.str.strip()
+if mtr_files:
+    mr_parts = [read_file(f) for f in mtr_files]
+    mr_parts = [d for d in mr_parts if not d.empty]
+    if mr_parts:
+        for i in range(len(mr_parts)):
+            mr_parts[i].columns = mr_parts[i].columns.str.strip()
+        mr = pd.concat(mr_parts, ignore_index=True)
         CS = col(mr, ["Sku","SKU","MSKU","Item SKU"])
         CQ = col(mr, ["Quantity","Qty","Units"])
         CD = col(mr, ["Shipment Date","Purchase Date","Order Date","Date"])
